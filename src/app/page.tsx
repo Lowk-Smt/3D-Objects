@@ -16,6 +16,9 @@ export const metadata: Metadata = {
 export default function HomePage() {
   return (
     <>
+      {/* The app shell's stylesheet is a plain static asset (public/vault/),
+          intentionally not imported through the bundler. */}
+      {/* eslint-disable-next-line @next/next/no-css-tags */}
       <link rel="stylesheet" href="/vault/styles.css" />
 
       <div id="errorBanner" className="error-banner hidden" role="alert"></div>
@@ -118,9 +121,11 @@ export default function HomePage() {
         <div className="modal-card">
           <h3>Optimize this file?</h3>
           <p>
-            This reduces file size (mesh + textures) and clears non-essential generator metadata. Meaningful
-            object, mesh and material names are preserved. Only the version you choose gets uploaded — your
-            original local file on disk is never modified.
+            This reduces file size (mesh + textures) and strips the tool/export metadata that came with the
+            model, re-tagging the result as a Model Vault export. Names you gave your objects, meshes,
+            materials and textures are kept exactly as they are. Only the version you choose gets uploaded —
+            your original local file on disk is never modified, and if optimizing would make the file larger
+            the original is uploaded instead.
           </p>
           <div className="fname" id="optimizeFileName"></div>
           <select className="sortsel" id="optimizePreset" style={{ width: "100%", height: 34, marginBottom: 14 }}>
@@ -176,6 +181,35 @@ export default function HomePage() {
                 <button type="button" className="btn" id="membersCloseBtn2">Close</button>
                 <button type="submit" className="btn primary" id="inviteSubmit">Add member</button>
               </div>
+            </form>
+          </div>
+
+          {/* Everyone (not just owners) can change their own password here.
+              The API revokes all of that account's sessions afterwards. */}
+          <div className="invite-box" id="passwordBox">
+            <h4 style={{ margin: "14px 0 8px", fontSize: 13 }}>Your password</h4>
+            <form id="pwForm">
+              <input
+                className="text-input"
+                id="pwCurrent"
+                type="password"
+                placeholder="Current password"
+                autoComplete="current-password"
+              />
+              <input
+                className="text-input"
+                id="pwNew"
+                type="password"
+                placeholder="New password (min 8 chars)"
+                autoComplete="new-password"
+              />
+              <div id="pwError" className="form-error hidden"></div>
+              <button type="submit" className="btn primary" style={{ width: "100%" }}>
+                Change password
+              </button>
+              <p style={{ fontSize: 11.5, color: "var(--muted)", margin: "8px 0 0" }}>
+                Changing your password signs you out everywhere and requires logging in again.
+              </p>
             </form>
           </div>
 
@@ -238,7 +272,9 @@ export default function HomePage() {
           }),
         }}
       />
-      <script type="module" src="/vault/app.js" />
+      {/* `defer` is implicit for module scripts; it is spelled out here so the
+          linter (and readers) see that this script never blocks rendering. */}
+      <script type="module" src="/vault/app.js" defer />
     </>
   );
 }

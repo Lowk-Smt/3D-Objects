@@ -1,17 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
-import fs from "node:fs/promises";
-import path from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { files } from "@/db/schema";
 import { canUserDeleteFiles, requireCsrf, requireSession } from "@/lib/auth";
-import { handleApiError, ApiError } from "@/lib/api-helpers";
-import { FILES_DIR, THUMBS_DIR } from "@/lib/config";
-import { getMimeForName } from "@/lib/files";
+import { ApiError, handleApiError } from "@/lib/api-helpers";
+import { getExt, getMimeForName, isSafeFileId, sanitizeDisplayName } from "@/lib/files";
 import { broadcast } from "@/lib/events";
+import { deleteFileRecords } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+
+async function loadFile(id: string) {
+  if (!isSafeFileId(id)) throw new ApiError(400, "Invalid file id.");
+  const row = (await db.select().from(files).where(eq(files.id, id)).limit(1))[0];
+  if (!row) throw new ApiError(404, "File not found. It may have been deleted by another user.");
+  return row;
+}
 
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -19,31 +24,39 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     const ctx = await requireSession(req);
     requireCsrf(req, ctx);
 
-    const row = (await db.select().from(files).where(eq(files.id, id)).limit(1))[0];
-    if (!row) throw new ApiError(404, "File not found. It may have been deleted by another user.");
+    const row = await loadFile(id);
 
     const body = await req.json().catch(() => null);
     const requestedBase = String(body?.name || "").trim();
-
     if (!requestedBase) throw new ApiError(400, "A file name is required.");
 
-    const cleanedBase = requestedBase.replace(/[<>:"/\\|?*\x00-\x1f]/g, "").trim();
-    if (!cleanedBase) throw new ApiError(400, "Invalid file name.");
+    // Renaming never changes a model's file type: the stored extension wins.
+    const ext = row.ext || getExt(row.name);
+    const withoutExt = ext && requestedBase.toLowerCase().endsWith(`.${ext.toLowerCase()}`)
+      ? requestedBase.slice(0, -(ext.length + 1))
+      : requestedBase;
 
-    // Extension is always preserved, exactly like the original client-only
-    // behavior — renaming never changes a model's file type.
-    const newName = row.ext ? `${cleanedBase}.${row.ext}` : cleanedBase;
+    const cleanedBase = sanitizeDisplayName(withoutExt);
+    if (!cleanedBase || cleanedBase === "file") {
+      throw new ApiError(400, "Invalid file name.");
+    }
+
+    const newName = ext ? `${cleanedBase}.${ext}` : cleanedBase;
     if (newName.length > 255) throw new ApiError(400, "File name is too long.");
 
-    const dirOld = path.dirname(row.path);
-    const newPath = dirOld && dirOld !== "." ? `${dirOld}/${newName}` : newName;
+    const dirOld = row.path.includes("/") ? row.path.slice(0, row.path.lastIndexOf("/")) : "";
+    const newPath = dirOld ? `${dirOld}/${newName}` : newName;
+    const mime = getMimeForName(newName);
+    const updatedAt = new Date();
 
+    // The bytes on disk keep their original name (storedName); only the
+    // logical path used for glTF companion resolution changes.
     await db
       .update(files)
-      .set({ name: newName, path: newPath, mime: getMimeForName(newName), updatedAt: new Date() })
+      .set({ name: newName, path: newPath, mime, updatedAt })
       .where(eq(files.id, id));
 
-    const payload = { id, name: newName, path: newPath, mime: getMimeForName(newName), updatedAt: Date.now() };
+    const payload = { id, name: newName, path: newPath, mime, updatedAt: updatedAt.getTime() };
     broadcast("file-updated", payload);
 
     return NextResponse.json({ file: payload });
@@ -58,24 +71,21 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
     const ctx = await requireSession(req);
     requireCsrf(req, ctx);
 
-    const row = (await db.select().from(files).where(eq(files.id, id)).limit(1))[0];
+    if (!isSafeFileId(id)) throw new ApiError(400, "Invalid file id.");
+
+    const row = (await db.select({ id: files.id }).from(files).where(eq(files.id, id)).limit(1))[0];
     if (!row) throw new ApiError(404, "File not found. It may already have been deleted.");
 
     if (!canUserDeleteFiles(ctx.user)) {
       throw new ApiError(403, "You don't have permission to delete files. Ask the owner for access.");
     }
 
-    await db.delete(files).where(eq(files.id, id));
-
-    await fs.rm(path.join(FILES_DIR, id), { recursive: true, force: true });
-    await fs.rm(path.join(THUMBS_DIR, `${id}.jpg`), { force: true });
-
+    // Removes bytes and row together (or neither) — see src/lib/storage.ts.
+    const result = await deleteFileRecords([id]);
     broadcast("file-deleted", { id });
 
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true, deleted: result.deleted, cleanupPending: !result.cleanupComplete });
   } catch (err) {
     return handleApiError(err);
   }
 }
-
-

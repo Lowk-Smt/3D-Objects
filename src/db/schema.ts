@@ -58,6 +58,12 @@ export const files = pgTable("files", {
   uploadedAt: timestamp("uploaded_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   hasThumbnail: boolean("has_thumbnail").notNull().default(false),
+  // Extension + content type of the thumbnail actually stored on disk, so the
+  // bytes on disk, their extension and the Content-Type header always agree
+  // (JPEG today, but a PNG/WebP thumbnail is stored as one rather than being
+  // mislabelled as .jpg/image/jpeg).
+  thumbExt: text("thumb_ext").notNull().default("jpg"),
+  thumbMime: text("thumb_mime").notNull().default("image/jpeg"),
   optimized: boolean("optimized").notNull().default(false),
   optimizePreset: text("optimize_preset"),
 });

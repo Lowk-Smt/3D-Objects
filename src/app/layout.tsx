@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Arena Next.js PostgreSQL Starter",
-  description: "Starter template with Next.js, Drizzle, and PostgreSQL.",
+  title: "Model Vault — Shared 3D Library",
+  description: "A shared, private multi-user 3D model library with live sync.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

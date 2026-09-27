@@ -1,10 +1,12 @@
 import { NextRequest } from "next/server";
-import { requireSession } from "@/lib/auth";
+import { isSessionAlive, requireSession } from "@/lib/auth";
 import { handleApiError } from "@/lib/api-helpers";
 import { bus } from "@/lib/events";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+
+const HEARTBEAT_MS = 25_000;
 
 /**
  * Server-Sent Events stream used to push real-time library changes
@@ -15,6 +17,10 @@ export const runtime = "nodejs";
  * serve a long-lived streaming Response natively (no custom server needed),
  * it auto-reconnects in the browser via EventSource, and this app only ever
  * needs server -> client push, not client -> server messaging.
+ *
+ * Clients that have fallen behind (or reconnect after a restart) resync by
+ * calling GET /api/files — the database is always the source of truth, this
+ * stream is only a notification channel.
  */
 export async function GET(req: NextRequest) {
   try {
@@ -27,7 +33,10 @@ export async function GET(req: NextRequest) {
 
     const stream = new ReadableStream({
       start(controller) {
+        let closed = false;
+
         const send = (event: string, data: unknown) => {
+          if (closed) return;
           try {
             controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
           } catch {
@@ -35,28 +44,40 @@ export async function GET(req: NextRequest) {
           }
         };
 
-        listener = (evt) => send(evt.type, evt.payload);
-        bus.on("broadcast", listener);
-
-        heartbeat = setInterval(() => {
-          try {
-            controller.enqueue(encoder.encode(`: ping\n\n`));
-          } catch {
-            /* ignore */
-          }
-        }, 25000);
-
-        send("connected", { userId: ctx.user.id });
-
-        req.signal.addEventListener("abort", () => {
+        const shutdown = () => {
+          if (closed) return;
           if (listener) bus.off("broadcast", listener);
           if (heartbeat) clearInterval(heartbeat);
+          closed = true;
           try {
             controller.close();
           } catch {
             /* ignore */
           }
-        });
+        };
+
+        listener = (evt) => send(evt.type, evt.payload);
+        bus.on("broadcast", listener);
+
+        heartbeat = setInterval(async () => {
+          if (closed) return;
+          try {
+            // A revoked session (password change, removed account) must stop
+            // receiving live updates immediately, not at the next page load.
+            if (!(await isSessionAlive(ctx.sessionId))) {
+              send("session-expired", { reason: "revoked" });
+              shutdown();
+              return;
+            }
+            send("heartbeat", { at: Date.now() });
+          } catch {
+            /* transient database hiccup — keep the stream open */
+          }
+        }, HEARTBEAT_MS);
+
+        send("connected", { userId: ctx.user.id });
+
+        req.signal.addEventListener("abort", shutdown);
       },
       cancel() {
         if (listener) bus.off("broadcast", listener);

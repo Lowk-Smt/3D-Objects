@@ -1,54 +1,53 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
+import { desc } from "drizzle-orm";
 import { db } from "@/db";
 import { files } from "@/db/schema";
 import { requireCsrf, requireSession } from "@/lib/auth";
-import { handleApiError, ApiError } from "@/lib/api-helpers";
-import { ensureStorageDirs, FILES_DIR, MAX_UPLOAD_BYTES } from "@/lib/config";
-import { getExt, getMimeForName, sanitizeRelativePath, sanitizeStoredName } from "@/lib/files";
+import { ApiError, handleApiError } from "@/lib/api-helpers";
+import { ensureStorageDirs, MAX_UPLOAD_BYTES } from "@/lib/config";
+import {
+  getExt,
+  getMimeForName,
+  sanitizeDisplayName,
+  sanitizeRelativePath,
+  serializeFile,
+} from "@/lib/files";
 import { broadcast } from "@/lib/events";
-import { desc } from "drizzle-orm";
+import {
+  discardFileData,
+  releaseUploadBytes,
+  reserveUploadBytes,
+  saveFileData,
+  scheduleTrashSweep,
+} from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+
+const OPTIMIZE_PRESETS = new Set(["high", "balanced", "small"]);
 
 export async function GET(req: NextRequest) {
   try {
     await requireSession(req);
     const rows = await db.select().from(files).orderBy(desc(files.uploadedAt));
-
-    const list = rows.map((row) => ({
-      id: row.id,
-      name: row.name,
-      ext: row.ext,
-      mime: row.mime,
-      size: row.size,
-      path: row.path,
-      uploaderId: row.uploaderId,
-      uploaderName: row.uploaderName,
-      uploadedAt: row.uploadedAt.getTime(),
-      updatedAt: row.updatedAt.getTime(),
-      hasThumbnail: row.hasThumbnail,
-      optimized: row.optimized,
-      optimizePreset: row.optimizePreset,
-    }));
-
-    return NextResponse.json({ files: list });
+    return NextResponse.json({ files: rows.map(serializeFile) });
   } catch (err) {
     return handleApiError(err);
   }
 }
 
 export async function POST(req: NextRequest) {
+  let reservedBytes = 0;
+
   try {
     const ctx = await requireSession(req);
     requireCsrf(req, ctx);
+    scheduleTrashSweep();
 
-    const contentLength = Number(req.headers.get("content-length") || 0);
-    if (contentLength && contentLength > MAX_UPLOAD_BYTES) {
-      throw new ApiError(413, `File is too large. Max upload size is ${(MAX_UPLOAD_BYTES / (1024 * 1024)).toFixed(0)}MB.`);
+    const declaredLength = Number(req.headers.get("content-length") || 0);
+    if (declaredLength && declaredLength > MAX_UPLOAD_BYTES) {
+      throw new ApiError(413, `File is too large. Max upload size is ${mb(MAX_UPLOAD_BYTES)}.`);
     }
 
     const form = await req.formData();
@@ -57,75 +56,95 @@ export async function POST(req: NextRequest) {
     if (!(blob instanceof Blob)) {
       throw new ApiError(400, "No file was provided.");
     }
-
     if (blob.size === 0) {
       throw new ApiError(400, "The uploaded file is empty.");
     }
-
     if (blob.size > MAX_UPLOAD_BYTES) {
-      throw new ApiError(413, `File is too large. Max upload size is ${(MAX_UPLOAD_BYTES / (1024 * 1024)).toFixed(0)}MB.`);
+      throw new ApiError(413, `File is too large. Max upload size is ${mb(MAX_UPLOAD_BYTES)}.`);
     }
 
-    const originalName = String(form.get("name") || (blob as File).name || "file").trim() || "file";
-    const relativePath = sanitizeRelativePath(String(form.get("path") || originalName));
+    // The display name and the relative path are only ever hints from the
+    // browser: both are sanitized here, and neither is trusted for anything
+    // that determines where bytes land on disk (that is the server-side UUID).
+    const rawName = String(form.get("name") || (blob as File).name || "file");
+    if (rawName.length > 512) throw new ApiError(400, "File name is too long.");
+    const originalName = sanitizeDisplayName(rawName);
+
+    const relativePath = sanitizeRelativePath(String(form.get("path") || originalName)) || originalName;
+    if (relativePath.length > 1024) throw new ApiError(400, "File path is too long.");
+
+    // "optimized"/"preset" are cosmetic metadata supplied by the client; keep
+    // them within a known shape instead of storing arbitrary strings.
     const optimized = String(form.get("optimized") || "") === "true";
-    const optimizePreset = form.get("preset") ? String(form.get("preset")) : null;
-
-    if (originalName.length > 255) {
-      throw new ApiError(400, "File name is too long.");
-    }
+    const presetRaw = form.get("preset") ? String(form.get("preset")) : "";
+    const optimizePreset = optimized && OPTIMIZE_PRESETS.has(presetRaw) ? presetRaw : null;
 
     ensureStorageDirs();
+    await reserveUploadBytes(blob.size);
+    reservedBytes = blob.size;
 
     const id = crypto.randomUUID();
-    const storedName = sanitizeStoredName(originalName);
-    const dir = path.join(FILES_DIR, id);
-    await fs.mkdir(dir, { recursive: true });
-
     const buffer = Buffer.from(await blob.arrayBuffer());
-    await fs.writeFile(path.join(dir, storedName), buffer);
+    const storedName = originalName;
 
-    const ext = getExt(originalName);
-    const mime = getMimeForName(originalName);
+    // Bytes first, metadata second — and the bytes are rolled back if the
+    // insert fails. This is the only way to guarantee we never end up with a
+    // row pointing at a file that was never written.
+    try {
+      await saveFileData(id, storedName, buffer);
+    } catch (err) {
+      reservedBytes = 0;
+      releaseUploadBytes(blob.size);
+      throw err;
+    }
+
     const now = new Date();
-
-    await db.insert(files).values({
+    const record = {
       id,
       name: originalName,
-      ext,
-      mime,
+      ext: getExt(originalName),
+      mime: getMimeForName(originalName),
       size: buffer.length,
-      path: relativePath || originalName,
+      path: relativePath,
       storedName,
       uploaderId: ctx.user.id,
       uploaderName: ctx.user.username,
       uploadedAt: now,
       updatedAt: now,
       hasThumbnail: false,
-      optimized,
-      optimizePreset,
-    });
-
-    const meta = {
-      id,
-      name: originalName,
-      ext,
-      mime,
-      size: buffer.length,
-      path: relativePath || originalName,
-      uploaderId: ctx.user.id,
-      uploaderName: ctx.user.username,
-      uploadedAt: now.getTime(),
-      updatedAt: now.getTime(),
-      hasThumbnail: false,
+      thumbExt: "jpg",
+      thumbMime: "image/jpeg",
       optimized,
       optimizePreset,
     };
 
+    try {
+      await db.insert(files).values(record);
+    } catch (err) {
+      console.error(`[files] Insert failed for upload ${id}; rolling back stored bytes:`, err);
+      await discardFileData(id);
+      reservedBytes = 0;
+      releaseUploadBytes(blob.size);
+      if (err instanceof ApiError) throw err;
+      throw new ApiError(
+        500,
+        "The upload could not be recorded in the library database, so nothing was saved. Please try again.",
+      );
+    }
+
+    releaseUploadBytes(blob.size);
+    reservedBytes = 0;
+
+    const meta = serializeFile(record);
     broadcast("file-added", meta);
 
     return NextResponse.json({ file: meta }, { status: 201 });
   } catch (err) {
+    if (reservedBytes) releaseUploadBytes(reservedBytes);
     return handleApiError(err);
   }
+}
+
+function mb(bytes: number): string {
+  return `${Math.round(bytes / (1024 * 1024))}MB`;
 }
