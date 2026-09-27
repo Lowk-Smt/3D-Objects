@@ -37,6 +37,33 @@ export function getMimeForName(name: string): string {
 }
 
 /**
+ * MIME types that must never be served straight from object storage with an
+ * `inline` disposition: a browser navigating to such a URL would render
+ * active content (HTML/SVG/XHTML/XML) on the storage origin, outside the
+ * app's CSP sandbox. These files keep flowing through the authenticated API
+ * route, which adds `Content-Security-Policy: sandbox` +
+ * `X-Content-Type-Options: nosniff` to the response. The MIME table is
+ * server-controlled (derived from the extension at upload time), so this
+ * gate is a deliberate allow/deny decision, not content sniffing.
+ */
+const PROXY_ONLY_MIMES = new Set([
+  "text/html",
+  "application/xhtml+xml",
+  "image/svg+xml",
+  "text/xml",
+  "application/xml",
+  "application/xslt+xml",
+]);
+
+/** True when a preview for this MIME type may use a presigned GET URL. */
+export function canPresignPreviewMime(mime: string | null | undefined): boolean {
+  const value = String(mime || "").toLowerCase().split(";")[0].trim();
+  if (!value) return false;
+  if (PROXY_ONLY_MIMES.has(value)) return false;
+  return true;
+}
+
+/**
  * File ids are server-generated UUIDs. Validating the shape before the value
  * is ever used to build an object-storage key is defense-in-depth (a DB
  * lookup already gates access, but never trust a key part).

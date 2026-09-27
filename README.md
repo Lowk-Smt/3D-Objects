@@ -92,6 +92,15 @@ The Three.js viewer is the original app's viewer, unchanged:
   `.fbx` and `.ply` preview natively. Anything else is stored and downloadable,
   and shows a "can't be previewed" card with a download button instead of
   failing silently.
+- **Preview loading is direct and deduplicated**: the API answers an
+  authorized preview request with a 120-second presigned GET for exactly one
+  private object key, and the browser fetches the bytes straight from the
+  bucket (no serverless proxy hop for multi-MB models). Repeated or rapid
+  clicks share one network request per file, an in-memory LRU cache serves
+  files you flip back to, a finished upload previews from the bytes the
+  browser already holds (no re-download), and switching models cancels only
+  the fetches nobody needs anymore. The concurrency rules are pinned by unit
+  tests (`tests/preview-cache.test.mjs`).
 - **Controls**: OrbitControls, camera auto-framing on load, **Reset view**
   (reframes the selected model), **Wireframe** toggle, and animation playback
   for animated models — every clip in the file plays automatically.
@@ -203,7 +212,7 @@ S3-compatible provider works; the steps below use Backblaze B2.
        "corsRuleName": "model-vault-uploads",
        "allowedOrigins": ["https://your-app.vercel.app", "http://localhost:3000"],
        "allowedHeaders": ["content-type"],
-       "allowedOperations": ["s3_put", "s3_head"],
+       "allowedOperations": ["s3_put", "s3_get", "s3_head"],
        "exposeHeaders": ["ETag"],
        "maxAgeSeconds": 3600
      }
@@ -214,11 +223,14 @@ S3-compatible provider works; the steps below use Backblaze B2.
    b2 bucket update --cors-rules "$(cat ./rules.json)" model-vault allPrivate
    ```
 
-   The `s3_put` operation is what permits browser uploads over the
-   S3-compatible API, and only `PUT` from your own origins is needed — reads
-   always go through the authenticated Next.js API, never straight from the
-   browser to B2. Replace the origins with your Vercel domain and
-   `http://localhost:3000` while developing.
+   `s3_put` is what permits browser uploads over the S3-compatible API, and
+   `s3_get` is what permits preview downloads (authorized short-lived
+   presigned GET URLs — see [Storage
+   architecture](#storage-architecture)). Previews degrade gracefully: if the
+   bucket's CORS rules do not (yet) allow `s3_get`, the browser automatically
+   falls back to streaming the bytes through the authenticated Next.js API,
+   so the viewer keeps working either way. Replace the origins with your
+   Vercel domain and `http://localhost:3000` while developing.
 
 That's it — no lifecycle rules, no public custom domains, no CDN in front of
 the bucket. Back up the bucket together with the database: jointly they are
@@ -242,6 +254,8 @@ Nothing hard-codes `localhost`; the frontend only calls relative paths
 4. Deploy. Set the bucket's CORS rules to include your
    `https://<app>.vercel.app` origin (see above), otherwise browser uploads
    are blocked by the browser — the app will say it can't reach storage.
+   Without `s3_get` in the CORS rules previews still work, but they stream
+   through the API instead of loading directly from the bucket.
 5. Open the app and create the owner account.
 
 Notes:
@@ -348,17 +362,32 @@ Upload (browser UI):
   browser ──PUT bytes directly to the bucket──► (presigned URL, single key, 5 min, no credentials)
   browser ──POST /api/files/complete──► Next.js verifies object, commits files row
 
-Download / preview / thumbnail:
-  browser ──GET /api/files/:id/{raw,download,thumbnail}──► Next.js checks session
+Preview (browser UI):
+  browser ──GET /api/files/:id/raw──► Next.js checks session ──► 120 s presigned GET (one key)
+  browser ──GET bytes directly from the bucket──► (no credentials; MIME + disposition pinned by the signature)
+
+Download / thumbnail / fallback preview:
+  browser ──GET /api/files/:id/{download,thumbnail} or /raw?proxy=1──► Next.js checks session
       ──► streams the private object back with correct MIME + disposition
 ```
 
-- **The bucket is private and stays private.** Browsers never `GET` from the
-  bucket directly: the authenticated API streams bytes after checking the
-  session, so permission checks, filenames, MIME types and security headers
-  are exactly the same as before. (The storage layer can also mint short-lived
-  presigned *GET* URLs after authorization; the routes stream today because
-  that preserves the existing headers, cookie auth and behaviour bit-for-bit.)
+- **The bucket is private and stays private.** Nothing is publicly readable.
+  Two authorized shapes exist, both minted only after the session check and
+  the database lookup succeed:
+  - *Preview downloads* return a presigned GET URL that grants exactly one
+    object key for **120 seconds**, with the response's Content-Type and
+    inline Content-Disposition baked into the signature. The browser fetches
+    bytes straight from the bucket — no credentials or cookies are ever sent
+    there — which keeps multi-MB model payloads off the serverless function
+    and makes previews noticeably faster. A leaked URL is a nearly worthless
+    capability: one key, two minutes, model bytes only (active-content MIME
+    types such as HTML/SVG/XML are never presigned — they keep streaming
+    through the API route, which adds `Content-Security-Policy: sandbox` +
+    `nosniff`; and a network-level failure falls back to the streamed path
+    automatically, so buckets without `s3_get` CORS still preview).
+  - *Downloads, thumbnails and the fallback path* stream through the
+    authenticated API exactly as before, preserving cookie auth, headers and
+    behaviour bit-for-bit.
 - **Uploads go direct to the bucket** because Vercel caps serverless request
   bodies at a few MB — a 300 MB model could never pass through the function.
   The server still makes every security decision: session, CSRF, size limits,
@@ -561,10 +590,17 @@ input. The UI's hidden/disabled controls are convenience only.
   (declared size vs stored bytes, byte-exact); empty files and oversized
   payloads get explicit `400`/`413` responses. Quota is reserved at presign
   time and re-checked at completion.
-- **Serving user content**: downloads are streamed from the private bucket
-  through the authenticated API with the stored MIME type, an RFC 5987
+- **Serving user content**: downloads, thumbnails and previews of
+  active-content MIME types (HTML/SVG/XML) are streamed from the private
+  bucket through the authenticated API with the stored MIME type, an RFC 5987
   `Content-Disposition`, `X-Content-Type-Options: nosniff` and a
   `default-src 'none'; sandbox` CSP; responses are `private, no-cache`.
+  Previews of inert model/asset MIME types instead return a presigned GET
+  that is minted only after authentication + authorization, grants exactly
+  one object key, expires in 120 seconds, and pins Content-Type + inline
+  disposition in the signature — the bucket never serves active content
+  inline and never serves anything without a signature it minted for that
+  key.
 - **Error leakage**: unexpected exceptions are logged server-side and returned
   as a generic 500; expected failures carry a specific, user-readable message.
   The users endpoint never returns password hashes.
@@ -614,6 +650,7 @@ npm run test:e2e -- --phase=2
 - `tests/paths.test.mjs` covers path normalization, glTF companion resolution
   (exact/relative/ambiguous/missing), MIME + extension lookup and download-name
   generation.
+- `tests/preview-cache.test.mjs` pins the viewer's download concurrency: duplicate opens share one request, a superseded caller's abort never kills a request another caller joined (including the join-before-release ordering `openModel` must use), rapid A→B→A ends on the newest model, failures/aborts are never cached, and the LRU bounds + upload handoff behave.
 - `tests/optimizer.test.mjs` runs the *same* `@gltf-transform` pipeline the
   browser uses (the devDependency must match the version pinned in the import
   map, and the test fails if it drifts) and asserts what the optimizer promises:

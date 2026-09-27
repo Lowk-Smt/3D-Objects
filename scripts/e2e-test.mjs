@@ -117,6 +117,31 @@ async function json(response) {
   }
 }
 
+/**
+ * Resolves what a browser receives from the preview endpoint. The raw route
+ * answers an authorized request with a 120 s presigned GET URL (browser
+ * fetches bytes straight from the bucket), except for active-content MIME
+ * types and `?proxy=1`, which stream through the API. Either way this
+ * returns the exact bytes the viewer would parse and their content-type.
+ */
+async function rawBytes(jar, id, { expectMode } = {}) {
+  const first = await request(jar, `/api/files/${id}/raw`, { redirect: "follow" });
+  assert.equal(first.status, 200, `raw ${id} -> ${first.status}`);
+  const contentType = first.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const info = await json(first);
+    assert.equal(info.mode, "presigned", "preview response announces the presigned mode");
+    assert.equal(info.expiresIn, 120, "preview presigned URLs expire in 120 seconds");
+    assert.ok(info.url && info.url.startsWith("https://"), "preview response carries an https presigned URL");
+    if (expectMode) assert.equal(info.mode, expectMode);
+    const direct = await fetch(info.url, { redirect: "error" });
+    assert.ok(direct.ok, `presigned GET -> ${direct.status}`);
+    return { bytes: Buffer.from(await direct.arrayBuffer()), contentType: direct.headers.get("content-type") || info.mime, mode: "presigned" };
+  }
+  if (expectMode) assert.equal("streamed", expectMode);
+  return { bytes: Buffer.from(await first.arrayBuffer()), contentType, mode: "streamed" };
+}
+
 async function login(credentials, jar = newJar()) {
   const response = await request(jar, "/api/auth/login", {
     method: "POST",
@@ -504,10 +529,8 @@ async function phase1() {
   await test("both users can read the preview bytes of both models", async () => {
     for (const jar of [ownerJar, memberJar]) {
       for (const file of [state.files.barrel, state.files.lantern]) {
-        const response = await request(jar, `/api/files/${file.id}/raw`);
-        assert.equal(response.status, 200, `raw ${file.name} -> ${response.status}`);
-        assert.equal(response.headers.get("content-type"), "model/gltf-binary");
-        const bytes = Buffer.from(await response.arrayBuffer());
+        const { bytes, contentType, mode } = await rawBytes(jar, file.id);
+        assert.equal(contentType, "model/gltf-binary", `raw ${file.name} content-type (${mode} mode)`);
         assert.equal(bytes.length, file.size);
         assert.equal(bytes.subarray(0, 4).toString("ascii"), "glTF");
       }
@@ -560,9 +583,8 @@ async function phase1() {
     assert.equal(texture.id, bundle.tex.id);
 
     // …and the resolved file is really fetchable by another member.
-    const response = await request(memberJar, `/api/files/${texture.id}/raw`);
-    assert.equal(response.status, 200);
-    assert.equal(Buffer.from(await response.arrayBuffer()).equals(PNG_1PX), true);
+    const textureBytes = await rawBytes(memberJar, texture.id);
+    assert.equal(textureBytes.bytes.equals(PNG_1PX), true);
   });
 
   await test("a missing companion file produces a clear client-side error", async () => {
@@ -768,8 +790,8 @@ async function phase1() {
     const bytes = Buffer.from("glTF this is definitely not valid");
     const { response, body } = await upload(ownerJar, { name: "corrupt.glb", bytes });
     assert.equal(response.status, 201);
-    const raw = await request(memberJar, `/api/files/${body.file.id}/raw`);
-    assert.equal(Buffer.from(await raw.arrayBuffer()).equals(bytes), true);
+    const corruptPreview = await rawBytes(memberJar, body.file.id);
+    assert.equal(corruptPreview.bytes.equals(bytes), true);
   });
 
   await test("unknown ids return 404 with a useful message", async () => {
@@ -880,10 +902,10 @@ async function phase1() {
     assert.equal(file.size, bytes.length);
     assert.equal(file.uploaderName, OWNER.username);
 
-    // The committed bytes are really there, for every member.
-    const raw = await request(memberJar, `/api/files/${file.id}/raw`);
-    assert.equal(raw.status, 200);
-    assert.equal(Buffer.from(await raw.arrayBuffer()).equals(bytes), true);
+    // The committed bytes are really there, for every member — via the
+    // presigned preview URL the browser would use.
+    const preview = await rawBytes(memberJar, file.id);
+    assert.equal(preview.bytes.equals(bytes), true);
 
     // Completion is idempotent: a retried complete returns the same file.
     const retry = await request(ownerJar, "/api/files/complete", {

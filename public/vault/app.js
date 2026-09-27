@@ -16,6 +16,10 @@ import {
   isInlineOrRemoteUri, sanitizeBaseName, findReferencedFile, getDownloadName
 } from './shared.js';
 
+/* ---- preview download orchestrator (cache + in-flight dedup + refcounted
+        abort), pure logic shared with tests/preview-cache.test.mjs ---- */
+import { createPreviewDownloader } from './preview-cache.js';
+
 /* ---- optimization pipeline imports ---- */
 import { WebIO } from '@gltf-transform/core';
 import { simplify, prune, dedup } from '@gltf-transform/functions';
@@ -201,7 +205,6 @@ const api = {
   }),
 
   listFiles: () => apiFetch('/api/files').then(d => d.files),
-  fetchRaw: (id) => apiFetch(`/api/files/${id}/raw`).then(r => r.blob()),
   upload: (file, path, extra, onProgress) => uploadWithProgress(file, path, extra, onProgress),
   rename: (id, name) => apiFetch(`/api/files/${id}`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
@@ -224,6 +227,83 @@ const api = {
   }),
   deleteUser: (id) => apiFetch(`/api/users/${id}`, { method: 'DELETE' }),
 };
+
+/* ============================================================
+   PREVIEW BYTE LOADER
+   ============================================================ */
+
+// One presigned-GET round trip per file, then bytes are cached in-memory.
+// The raw endpoint authorizes the session and answers with a 120-second
+// presigned GET URL for exactly one private bucket key — the fetch below is
+// the only request that ever goes straight to storage (no cookies, no
+// credentials; the signature is the authorization and it expires quickly).
+
+async function fetchDirectBlob(url, signal){
+  let response;
+  try {
+    // Cross-origin request to object storage. No credentials: presigned GET
+    // authorization travels in the signed query string, and none of the
+    // app's cookies may ever reach the storage origin.
+    response = await fetch(url, { signal, credentials: 'omit', redirect: 'error' });
+  } catch (err){
+    if (signal && signal.aborted) throw err; // caller cancelled — propagate AbortError
+    // Network/CORS-level failure of the direct fetch. Handled by the caller
+    // with an automatic fallback through the authenticated API route.
+    throw new ApiClientError(0, 'Could not reach object storage for this file.');
+  }
+  if (!response.ok){
+    // 403 from storage almost always means the short-lived URL expired
+    // (e.g. the tab sat on it for over 120 s) — a retry mints a fresh one.
+    const message = response.status === 403
+      ? 'The preview link expired. Open the file again to fetch a fresh one.'
+      : `Could not download this file from storage (${response.status}).`;
+    throw new ApiClientError(response.status, message);
+  }
+  return response.blob();
+}
+
+async function fetchProxiedBlob(meta, signal){
+  // Same authorization as every other API call (session cookie); the server
+  // streams the bytes with the sandbox/nosniff headers the bucket can't add.
+  const response = await apiFetch(`/api/files/${encodeURIComponent(meta.id)}/raw?proxy=1`, { signal });
+  if (response instanceof Response) return response.blob();
+  throw new ApiClientError(0, 'Unexpected preview response from the server.');
+}
+
+async function fetchModelBytes(meta, signal){
+  const info = await apiFetch(`/api/files/${encodeURIComponent(meta.id)}/raw`, { signal });
+
+  if (info && typeof info.url === 'string'){
+    try {
+      return await fetchDirectBlob(info.url, signal);
+    } catch (err){
+      // Only network-level failures fall back; storage's own answers
+      // (403 expired link, 404 missing object, …) must surface as-is so the
+      // user sees the real cause instead of a silent second request.
+      if ((signal && signal.aborted) || (err instanceof ApiClientError && err.status !== 0)) throw err;
+      return await fetchProxiedBlob(meta, signal);
+    }
+  }
+
+  // The server streamed the bytes itself (active-content MIME types are
+  // never presigned — they need the route's CSP sandbox headers).
+  if (info instanceof Response) return info.blob();
+
+  throw new ApiClientError(0, 'Unexpected preview response from the server.');
+}
+
+/**
+ * Cache + in-flight de-duplication + reference-counted abort for preview
+ * downloads (logic in preview-cache.js, rules pinned by
+ * tests/preview-cache.test.mjs):
+ *   - concurrent/duplicate openModel() calls for one file share a single
+ *     network request;
+ *   - aborting one caller never aborts a request another caller joined —
+ *     the request is cancelled only when the last interested caller leaves;
+ *   - loaded blobs are kept in a bounded LRU (model bytes are immutable) and
+ *     evicted when files are deleted; uploads seed it directly (handoff).
+ */
+const previewLoader = createPreviewDownloader({ fetch: fetchModelBytes });
 
 function uploadWithProgress(file, relPath, extra, onProgress){
   // Presigned upload flow (same signature, same progress reporting, same
@@ -303,6 +383,11 @@ function uploadWithProgress(file, relPath, extra, onProgress){
       } finally {
         completeTimer.end();
       }
+
+      // Upload -> preview handoff: the browser is still holding exactly the
+      // bytes it PUT to storage, so the automatic preview after the upload
+      // is served from the preview cache instead of downloading them again.
+      previewLoader.seed(completed.file.id, file, file.size);
 
       totalUploadTimer.end(`${file.size}B`);
       return completed.file;
@@ -628,7 +713,23 @@ animate();
 
 let current = null;
 let previewToken = 0;
-let wireframeOn = false;
+/** { id, controller } of the preview load in flight, if any. */
+let previewAbortCtl = null;
+
+/**
+ * Invalidate + cancel the in-flight preview load — but only when the file it
+ * is loading is among `ids` (a delete of some unrelated file must never
+ * disturb a preview the user is waiting for). Bumping the token makes every
+ * in-flight openModel() checkpoint bail; aborting the controller releases
+ * the loader reference so unneeded bytes stop flowing.
+ */
+function cancelPreviewLoad(ids){
+  if (!previewAbortCtl) return;
+  if (ids && !ids.includes(previewAbortCtl.id)) return;
+  previewToken++;
+  previewAbortCtl.controller.abort();
+  previewAbortCtl = null;
+}
 
 function disposeTree(root){
   root.traverse(object => {
@@ -751,7 +852,10 @@ async function createDependencyUrl(modelMeta, uri, cache, createdUrls){
     throw new Error(`Missing companion file "${key}". Add that file to the library along with "${modelMeta.name}".`);
   }
 
-  const blob = retypeBlob(await api.fetchRaw(dependencyMeta.id), dependencyMeta.name);
+  // Companion bytes go through the same preview loader as models: duplicate
+  // fetches (a texture referenced by several buffers) collapse into one
+  // request, and the blob is cached for the next .gltf open.
+  const blob = retypeBlob(await previewLoader.load(dependencyMeta), dependencyMeta.name);
   const objectUrl = URL.createObjectURL(blob);
   createdUrls.push(objectUrl);
   cache.set(key, objectUrl);
@@ -1024,6 +1128,20 @@ async function updateUsage(){
 
 async function openModel(meta){
   const token = ++previewToken;
+
+  // ORDER MATTERS: the new caller joins the shared download FIRST, and only
+  // then is the previous caller's controller aborted. Releasing before
+  // joining would drop the last reference and cancel a duplicate
+  // openModel()'s in-flight request instead of sharing it. With this order,
+  // preview-cache.js refcounting guarantees:
+  //   - duplicate openModel() calls for one file share ONE network request;
+  //   - aborting a superseded caller never aborts a request another caller
+  //     joined — the request dies only when the last interested caller leaves.
+  const loadCtl = new AbortController();
+  const loadPromise = previewLoader.load(meta, { signal: loadCtl.signal });
+  if (previewAbortCtl) previewAbortCtl.controller.abort();
+  previewAbortCtl = { id: meta.id, controller: loadCtl };
+
   emptyCard.classList.add('hidden');
   fbCard.classList.add('hidden');
   setStatus('Loading ' + meta.name + '…');
@@ -1032,11 +1150,13 @@ async function openModel(meta){
   let blob;
   const fetchTimer = perf.time(`preview:fetch:${meta.name}`);
   try {
-    blob = await api.fetchRaw(meta.id);
+    blob = await loadPromise;
   } catch (error){
     fetchTimer.end('failed');
     openTimer.end('fetch failed');
-    if (token !== previewToken) return;
+    // Superseded (a newer openModel won) or deliberately cancelled (the file
+    // was deleted mid-load): the newer UI state owns the screen — stay silent.
+    if (token !== previewToken || loadCtl.signal.aborted) return;
     showFallback(meta, error.message || 'Could not download this file from the server.');
     setStatus('');
     return;
@@ -1216,6 +1336,11 @@ function removeFilesFromState(ids){
   state.files = state.files.filter(file => !idSet.has(file.id));
   for (const id of ids) state.selected.delete(id);
 
+  // The bytes are gone from the library: drop any cached preview blob, and
+  // cancel an in-flight load of a deleted file (never of an unrelated one).
+  for (const id of ids) previewLoader.evict(id);
+  cancelPreviewLoad(ids);
+
   if (state.activeId && idSet.has(state.activeId)){
     state.activeId = null;
     clearModel();
@@ -1385,9 +1510,20 @@ function setConn(status, text){
 async function syncFileList(){
   try {
     const files = await api.listFiles();
+    const knownIds = new Set(state.files.map(f => f.id));
     state.files = files.map(mapServerFile);
+
+    // Reconcile the preview cache with the server's truth: blobs for files
+    // that disappeared while the stream was down must not linger.
+    let removed = false;
+    for (const id of knownIds){
+      if (!state.files.some(f => f.id === id)){ previewLoader.evict(id); removed = true; }
+    }
+
     if (state.activeId && !state.files.some(f => f.id === state.activeId)){
+      const removedActiveId = state.activeId;
       state.activeId = null;
+      if (removed) cancelPreviewLoad([removedActiveId]);
       clearModel();
       resetCamera();
       showEmpty();
