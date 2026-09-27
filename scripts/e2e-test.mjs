@@ -4,7 +4,7 @@
  *
  * Drives the real HTTP API (auth, uploads, downloads, thumbnails, deletes,
  * authorization, quota, rate limiting, SSE) against a running server, exactly
- * the way two browsers would. Nothing is mocked: Postgres, Cloudflare R2
+ * the way two browsers would. Nothing is mocked: Postgres, Backblaze B2
  * object storage and the SSE stream are all the real thing.
  *
  * Usage (fresh database required for phase 1):

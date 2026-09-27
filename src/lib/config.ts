@@ -2,9 +2,10 @@
 // deployed somewhere other than a local sandbox without code changes.
 // See .env.example for the documented list.
 //
-// Model binaries and thumbnails live in the private Cloudflare R2 bucket
-// (see src/lib/r2.ts) — never on a server-local filesystem, which Vercel
-// functions do not persist. There is intentionally no STORAGE_DIR anymore.
+// Model binaries and thumbnails live in a private S3-compatible bucket
+// (Backblaze B2 in production — see src/lib/r2.ts) — never on a server-local
+// filesystem, which Vercel functions do not persist. There is intentionally
+// no STORAGE_DIR anymore.
 
 export const MAX_UPLOAD_BYTES = positiveInt(process.env.MAX_UPLOAD_MB, 300) * 1024 * 1024;
 export const MAX_THUMBNAIL_BYTES = 3 * 1024 * 1024;

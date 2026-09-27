@@ -1,11 +1,13 @@
 /**
- * Cloudflare R2 object storage abstraction.
+ * S3-compatible object storage abstraction (Backblaze B2 in production; any
+ * other S3-compatible provider — Cloudflare R2, MinIO, … — works too).
  *
- * This is the ONLY module that talks to R2 (via the AWS S3-compatible API).
+ * This is the ONLY module that talks to object storage (via the AWS
+ * S3-compatible API).
  * Everything above it (src/lib/storage.ts, the API routes) works in terms of
  * file ids + sanitized names and never touches credentials, endpoints or
- * buckets directly — and nothing here is ever imported by browser code, so R2
- * credentials cannot leak to the client.
+ * buckets directly — and nothing here is ever imported by browser code, so
+ * storage credentials cannot leak to the client.
  *
  * Design notes:
  *
@@ -53,10 +55,10 @@ export class R2Error extends Error {
 /* ------------------------------------------------------------------- config */
 
 export type R2Config = {
-  accountId: string;
   accessKeyId: string;
   secretAccessKey: string;
   bucket: string;
+  /** The provider's actual S3-compatible endpoint, e.g. https://s3.us-west-004.backblazeb2.com */
   endpoint: string;
 };
 
@@ -69,18 +71,36 @@ function readEnv(name: string): string {
 
 /** Null when any required variable is missing — callers decide how to fail. */
 export function r2ConfigFromEnv(): R2Config | null {
-  const accountId = readEnv("R2_ACCOUNT_ID");
   const accessKeyId = readEnv("R2_ACCESS_KEY_ID");
   const secretAccessKey = readEnv("R2_SECRET_ACCESS_KEY");
   const bucket = readEnv("R2_BUCKET_NAME");
-  if (!accountId || !accessKeyId || !secretAccessKey || !bucket) return null;
-
-  const endpoint = readEnv("R2_ENDPOINT") || `https://${accountId}.r2.cloudflarestorage.com`;
-  return { accountId, accessKeyId, secretAccessKey, bucket, endpoint };
+  const endpoint = readEnv("R2_ENDPOINT");
+  if (!accessKeyId || !secretAccessKey || !bucket || !endpoint) return null;
+  return { accessKeyId, secretAccessKey, bucket, endpoint };
 }
 
 export function isR2Configured(): boolean {
   return r2ConfigFromEnv() !== null;
+}
+
+/**
+ * SigV4 signing region for a given S3-compatible endpoint.
+ *
+ * Backblaze B2 expects requests to be signed with the concrete region
+ * embedded in its endpoint host (`s3.<region>.backblazeb2.com`), while the
+ * other providers we support (Cloudflare R2, MinIO, …) accept the
+ * provider-neutral `auto`. The region is derived from R2_ENDPOINT only —
+ * never from any account id.
+ */
+export function regionFromEndpoint(endpoint: string): string {
+  let host: string;
+  try {
+    host = new URL(endpoint).hostname;
+  } catch {
+    return "auto";
+  }
+  const match = /^(?:[^.]+\.)?s3\.([a-z0-9-]+)\.backblazeb2\.com$/i.exec(host);
+  return match ? match[1] : "auto";
 }
 
 /**
@@ -93,8 +113,8 @@ export function requireR2Config(): R2Config {
   if (!config) {
     throw new R2Error(
       503,
-      "Object storage is not configured. Set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, " +
-        "R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME (see .env.example).",
+      "Object storage is not configured. Set R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, " +
+        "R2_BUCKET_NAME and R2_ENDPOINT (see .env.example).",
     );
   }
   return config;
@@ -201,7 +221,8 @@ export type ObjectListing = {
 
 /**
  * Minimal object-store surface used by the app. R2Store implements it against
- * Cloudflare R2; MemoryObjectStore implements it in memory for unit tests.
+ * an S3-compatible provider (e.g. Backblaze B2); MemoryObjectStore implements
+ * it in memory for unit tests.
  */
 export interface ObjectStore {
   put(key: string, data: Buffer, contentType: string): Promise<void>;
@@ -263,15 +284,16 @@ export class R2Store implements ObjectStore {
     const config = requireR2Config();
     this.bucket = config.bucket;
     this.client = new S3Client({
-      region: "auto",
+      region: regionFromEndpoint(config.endpoint),
       endpoint: config.endpoint,
       credentials: {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
       },
-      // R2 only requires checksums when an operation mandates them; the SDK's
-      // default "compute when supported" breaks against some S3-compatible
-      // endpoints, so opt into checksums only when required.
+      // S3-compatible providers (Backblaze B2, Cloudflare R2, …) only require
+      // checksums when an operation mandates them; the SDK's default
+      // "compute when supported" breaks against some endpoints, so opt into
+      // checksums only when required.
       requestChecksumCalculation: "WHEN_REQUIRED",
     });
     return { client: this.client, bucket: this.bucket };
