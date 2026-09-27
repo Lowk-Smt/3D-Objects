@@ -42,7 +42,8 @@ import {
  * Everything that touches uploaded bytes lives here, so the "database row and
  * stored object agree" invariant is enforced in exactly one place.
  *
- * Binaries live in the private Cloudflare R2 bucket (see src/lib/r2.ts);
+ * Binaries live in a private S3-compatible bucket (Backblaze B2, see
+ * src/lib/r2.ts);
  * Postgres is the metadata source of truth. There is no server-local
  * filesystem involved — Vercel functions have no persistent disk, and this
  * module never assumes otherwise.

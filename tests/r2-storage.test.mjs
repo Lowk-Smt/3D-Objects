@@ -17,6 +17,7 @@ import {
   presignedDisposition,
   putObjectWithVerify,
   r2ConfigFromEnv,
+  regionFromEndpoint,
   requireR2Config,
   thumbnailCandidateKeys,
   thumbnailObjectKey,
@@ -52,6 +53,8 @@ const ID = "1a0c27e7-c029-4cc5-84f8-3b552ca49f88";
 const KEY_PATTERN = /^files\/[A-Za-z0-9_-]{1,64}\/[^/]+$/;
 
 function withR2Env(vars, fn) {
+  // R2_ACCOUNT_ID is cleared too (but never used): a leftover value from an
+  // older deployment must be ignored — configuration never depends on it.
   const names = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME", "R2_ENDPOINT"];
   const saved = {};
   for (const name of names) saved[name] = process.env[name];
@@ -326,19 +329,73 @@ test("missing R2 configuration fails fast with 503, never at import time", () =>
   withR2Env({}, () => {
     assert.equal(isR2Configured(), false);
     assert.equal(r2ConfigFromEnv(), null);
-    assert.throws(() => requireR2Config(), (err) => err instanceof R2Error && err.status === 503);
+    assert.throws(
+      () => requireR2Config(),
+      (err) => {
+        assert.ok(err instanceof R2Error && err.status === 503);
+        // The message names exactly the four required variables…
+        assert.match(err.message, /R2_ACCESS_KEY_ID/);
+        assert.match(err.message, /R2_SECRET_ACCESS_KEY/);
+        assert.match(err.message, /R2_BUCKET_NAME/);
+        assert.match(err.message, /R2_ENDPOINT/);
+        // …and never asks for an account id.
+        assert.ok(!/R2_ACCOUNT_ID/.test(err.message), `account id must not be required: ${err.message}`);
+        return true;
+      },
+    );
   });
 });
 
-test("R2 configuration reads env only, with a derived default endpoint", () => {
+test("R2 configuration needs only key, secret, bucket and endpoint — no account id", () => {
   withR2Env(
-    { R2_ACCOUNT_ID: "acct", R2_ACCESS_KEY_ID: "key", R2_SECRET_ACCESS_KEY: "secret", R2_BUCKET_NAME: "vault" },
+    {
+      R2_ACCESS_KEY_ID: "key",
+      R2_SECRET_ACCESS_KEY: "secret",
+      R2_BUCKET_NAME: "vault",
+      R2_ENDPOINT: "https://s3.us-west-004.backblazeb2.com",
+    },
     () => {
       assert.equal(isR2Configured(), true);
       const config = r2ConfigFromEnv();
-      assert.equal(config.endpoint, "https://acct.r2.cloudflarestorage.com");
+      assert.equal(config.accessKeyId, "key");
+      assert.equal(config.secretAccessKey, "secret");
+      assert.equal(config.bucket, "vault");
+      // R2_ENDPOINT is used verbatim as the actual S3-compatible endpoint.
+      assert.equal(config.endpoint, "https://s3.us-west-004.backblazeb2.com");
+      assert.ok(!("accountId" in config), "config must not carry an account id");
+      // requireR2Config succeeds with exactly these four values.
+      assert.equal(requireR2Config().endpoint, "https://s3.us-west-004.backblazeb2.com");
     },
   );
+});
+
+test("every one of the four storage variables is required on its own", () => {
+  const all = {
+    R2_ACCESS_KEY_ID: "key",
+    R2_SECRET_ACCESS_KEY: "secret",
+    R2_BUCKET_NAME: "vault",
+    R2_ENDPOINT: "https://s3.us-west-004.backblazeb2.com",
+  };
+  for (const omitted of Object.keys(all)) {
+    const vars = { ...all };
+    delete vars[omitted];
+    withR2Env(vars, () => {
+      assert.equal(r2ConfigFromEnv(), null, `${omitted} must be required`);
+      assert.equal(isR2Configured(), false, `${omitted} must be required`);
+    });
+  }
+});
+
+test("no endpoint is ever derived from an account id", () => {
+  // A legacy R2_ACCOUNT_ID in the environment cannot stand in for R2_ENDPOINT.
+  withR2Env(
+    { R2_ACCOUNT_ID: "acct", R2_ACCESS_KEY_ID: "key", R2_SECRET_ACCESS_KEY: "secret", R2_BUCKET_NAME: "vault" },
+    () => {
+      assert.equal(r2ConfigFromEnv(), null);
+      assert.equal(isR2Configured(), false);
+    },
+  );
+  // And with the four required values present, an account id is ignored entirely.
   withR2Env(
     {
       R2_ACCOUNT_ID: "acct",
@@ -348,9 +405,23 @@ test("R2 configuration reads env only, with a derived default endpoint", () => {
       R2_ENDPOINT: "http://127.0.0.1:9000",
     },
     () => {
-      assert.equal(r2ConfigFromEnv().endpoint, "http://127.0.0.1:9000");
+      const config = r2ConfigFromEnv();
+      assert.equal(config.endpoint, "http://127.0.0.1:9000");
+      assert.ok(!("accountId" in config));
     },
   );
+});
+
+test("signing region: concrete for Backblaze B2 endpoints, neutral otherwise", () => {
+  // Backblaze B2 signs with the region embedded in its S3 endpoint host.
+  assert.equal(regionFromEndpoint("https://s3.us-west-004.backblazeb2.com"), "us-west-004");
+  assert.equal(regionFromEndpoint("https://s3.us-east-005.backblazeb2.com/"), "us-east-005");
+  // Custom endpoints: the bucket hostname variant also parses.
+  assert.equal(regionFromEndpoint("https://mybucket.s3.us-west-004.backblazeb2.com"), "us-west-004");
+  // Every other S3-compatible provider keeps the provider-neutral "auto".
+  assert.equal(regionFromEndpoint("https://abc123.r2.cloudflarestorage.com"), "auto");
+  assert.equal(regionFromEndpoint("http://127.0.0.1:9000"), "auto");
+  assert.equal(regionFromEndpoint("not a url"), "auto");
 });
 
 test("presigned URLs embed the key and carry no credentials", async () => {

@@ -7,14 +7,15 @@ optionally optimize GLBs before sharing them, and see everyone else's
 uploads/renames/deletes/thumbnails appear live — no manual refresh required.
 
 It is deliberately a *small* app with a boring, durable shape: one Next.js app,
-one Postgres database for metadata, one private Cloudflare R2 bucket for bytes.
-That shape is exactly what the app deploys as — on Vercel, on a VPS, or on your
-laptop — and the few places where the deployment model shows are called out
-under [Limitations](#limitations).
+one Postgres database for metadata, one private Backblaze B2 bucket for bytes
+(any S3-compatible object store works — B2 is what the deployment instructions
+below use). That shape is exactly what the app deploys as — on Vercel, on a VPS,
+or on your laptop — and the few places where the deployment model shows are
+called out under [Limitations](#limitations).
 
 ```
 Browser ──► Next.js (Vercel) ──┬──► PostgreSQL      metadata (users, sessions, files)
-                               └──► Cloudflare R2   model binaries + thumbnails (private bucket)
+                               └──► Backblaze B2    model binaries + thumbnails (private bucket)
 ```
 
 ---
@@ -25,7 +26,7 @@ Browser ──► Next.js (Vercel) ──┬──► PostgreSQL      metadata (
 - [Sharing a library with a few people](#sharing-a-library-with-a-few-people)
 - [The viewer](#the-viewer)
 - [Configuration](#configuration)
-- [Setting up Cloudflare R2](#setting-up-cloudflare-r2)
+- [Setting up Backblaze B2](#setting-up-backblaze-b2)
 - [Deploying on Vercel](#deploying-on-vercel)
 - [Local development](#local-development)
 - [Project structure](#project-structure)
@@ -46,8 +47,8 @@ Browser ──► Next.js (Vercel) ──┬──► PostgreSQL      metadata (
 
 ## Quick start
 
-You need a Postgres database and a Cloudflare R2 bucket (both have free tiers —
-see [Setting up Cloudflare R2](#setting-up-cloudflare-r2)).
+You need a Postgres database and a Backblaze B2 bucket (both have free tiers —
+see [Setting up Backblaze B2](#setting-up-backblaze-b2)).
 
 ```bash
 cp .env.example .env          # then set DATABASE_URL + the R2_* variables
@@ -62,7 +63,7 @@ Open `http://localhost:3000`. With no accounts in the database the app shows
 owner. Afterwards only the owner can invite more members (Members → Invite).
 
 Point every computer/phone at the **same URL** — they all share one Postgres
-database and one R2 bucket, so they are looking at the same library.
+database and one bucket, so they are looking at the same library.
 
 ## Sharing a library with a few people
 
@@ -114,22 +115,22 @@ replaced with a real backend:
 
 | Concern | Original file | Model Vault |
 |---|---|---|
-| Source of truth | Browser IndexedDB | PostgreSQL (metadata) + Cloudflare R2 (bytes) |
+| Source of truth | Browser IndexedDB | PostgreSQL (metadata) + Backblaze B2 (bytes) |
 | Multi-user | Not possible | Any number of accounts on one shared library |
 | Live updates | None | Server-Sent Events pushed to every open tab |
 | Auth | None | Username + password (bcrypt), server-side sessions |
 | Permissions | None | Owner / member, per-member delete permission |
-| Thumbnails | Local data URL | Generated in the browser, stored in R2, served to everyone |
-| Downloads | From a local blob | Streamed from R2 through the authenticated API with the original filename + MIME type |
+| Thumbnails | Local data URL | Generated in the browser, stored in the bucket, served to everyone |
+| Downloads | From a local blob | Streamed from the bucket through the authenticated API with the original filename + MIME type |
 | Storage limits | None | `MAX_UPLOAD_MB` per file, optional `LIBRARY_QUOTA_BYTES` for the workspace |
 
-### Why Next.js + Postgres + R2, and SSE rather than WebSockets
+### Why Next.js + Postgres + object storage, and SSE rather than WebSockets
 
 Model Vault is a Next.js (App Router) application: the backend is route handlers
-with Postgres via Drizzle for metadata and Cloudflare R2 (S3-compatible object
+with Postgres via Drizzle for metadata and Backblaze B2 (S3-compatible object
 storage) for bytes. That split is what makes the app deployable to Vercel —
-serverless functions have no persistent disk, so bytes live in R2 while the
-database stays the source of truth for everything else.
+serverless functions have no persistent disk, so bytes live in the bucket while
+the database stays the source of truth for everything else.
 
 Real-time sync uses **Server-Sent Events**: Next.js route handlers can return a
 streaming `Response` with no custom server, `EventSource` reconnects by itself
@@ -145,11 +146,10 @@ full list. The important ones:
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | *(required)* | Postgres connection string. The app refuses to boot without it. |
-| `R2_ACCOUNT_ID` | *(required)* | Cloudflare account ID. |
-| `R2_ACCESS_KEY_ID` | *(required)* | R2 S3 API access key (Object Read & Write on the bucket). |
-| `R2_SECRET_ACCESS_KEY` | *(required)* | R2 S3 API secret. Never committed, never sent to the browser. |
+| `R2_ACCESS_KEY_ID` | *(required)* | S3 access key — a Backblaze B2 application key ID (read/write on the bucket). |
+| `R2_SECRET_ACCESS_KEY` | *(required)* | S3 secret — the B2 application key value. Never committed, never sent to the browser. |
 | `R2_BUCKET_NAME` | *(required)* | Private bucket for model binaries + thumbnails. |
-| `R2_ENDPOINT` | `https://<account>.r2.cloudflarestorage.com` | Override only for S3-compatible local dev (e.g. MinIO). |
+| `R2_ENDPOINT` | *(required)* | The provider's actual S3-compatible endpoint, no bucket in it — e.g. `https://s3.us-west-004.backblazeb2.com`. |
 | `MAX_UPLOAD_MB` | `300` | Per-file upload limit, enforced server-side. |
 | `LIBRARY_QUOTA_BYTES` | *(unset)* | Workspace storage cap. When set, uploads that would exceed it are rejected with 413. |
 | `PENDING_UPLOAD_TTL_MINUTES` | `30` | How long a presigned upload reservation stays valid. |
@@ -166,38 +166,63 @@ configure, rotate or leak.
 `.env` / `.env.local` are git-ignored. On Vercel, set variables in the project
 settings instead of committing a file.
 
-## Setting up Cloudflare R2
+## Setting up Backblaze B2
 
-1. **Create the bucket.** In the Cloudflare dashboard go to **R2 Object
-   Storage → Create bucket**, pick a name (e.g. `model-vault`), and leave it
-   **private** — do *not* enable public access or a public custom domain. The
-   app authorizes every byte through its own API; the bucket must never be
-   world-readable.
-2. **Create an API token.** Go to **R2 → Manage R2 API Tokens → Create API
-   token** with **Object Read & Write** permission scoped to that bucket. Copy
-   the **Access Key ID** and **Secret Access Key** into `R2_ACCESS_KEY_ID` /
-   `R2_SECRET_ACCESS_KEY`, and your account ID into `R2_ACCOUNT_ID`.
-3. **Configure CORS** so browsers can `PUT` uploads directly to R2. In the
-   bucket's **Settings → CORS policy**, allow your app's origin (add your
-   Vercel domain *and* `http://localhost:3000` while developing):
+Model Vault talks to storage through the standard S3 API, so any
+S3-compatible provider works; the steps below use Backblaze B2.
+
+1. **Create the bucket.** In the Backblaze console (**B2 → Buckets → Add a
+   Bucket**), pick a name (e.g. `model-vault`) and leave it **private** — do
+   *not* enable public access or a custom domain. The app authorizes every
+   byte through its own API; the bucket must never be world-readable.
+2. **Create an application key.** Go to **App Keys → Add a New Application
+   Key** and scope it to that bucket with read/write capability. Copy the
+   **keyID** into `R2_ACCESS_KEY_ID` and the **applicationKey** into
+   `R2_SECRET_ACCESS_KEY` (the application key value is shown only once). The
+   account's *master* application key does not work with the S3-compatible
+   API — always use a dedicated application key.
+3. **Set the endpoint.** Copy the bucket's **Endpoint** (shown on the bucket
+   page, e.g. `s3.us-west-004.backblazeb2.com`) into `R2_ENDPOINT`,
+   including the `https://` scheme:
+
+   ```bash
+   R2_ENDPOINT=https://s3.us-west-004.backblazeb2.com
+   ```
+
+   A B2 account lives in a single region, so all of its buckets share one
+   endpoint — copy the value from the console rather than guessing.
+4. **Configure CORS** so browsers can `PUT` uploads directly to the bucket.
+   Save this as `rules.json` and apply it with the
+   [B2 command-line tool](https://www.backblaze.com/docs/cloud-storage-enable-cors-with-the-cli)
+   (authorize it with a key that has bucket-write capability, e.g. your
+   account's master application key):
 
    ```json
    [
      {
-       "AllowedOrigins": ["https://your-app.vercel.app", "http://localhost:3000"],
-       "AllowedMethods": ["PUT"],
-       "AllowedHeaders": ["content-type"],
-       "ExposeHeaders": ["ETag"],
-       "MaxAgeSeconds": 3600
+       "corsRuleName": "model-vault-uploads",
+       "allowedOrigins": ["https://your-app.vercel.app", "http://localhost:3000"],
+       "allowedHeaders": ["content-type"],
+       "allowedOperations": ["s3_put", "s3_head"],
+       "exposeHeaders": ["ETag"],
+       "maxAgeSeconds": 3600
      }
    ]
    ```
 
-   Only `PUT` from your own origins is needed — reads always go through the
-   authenticated Next.js API, never straight from the browser to R2.
+   ```bash
+   b2 bucket update --cors-rules "$(cat ./rules.json)" model-vault allPrivate
+   ```
 
-That's it — no lifecycle rules, no public domains, no workers. Back up the
-bucket together with the database: jointly they are the entire library.
+   The `s3_put` operation is what permits browser uploads over the
+   S3-compatible API, and only `PUT` from your own origins is needed — reads
+   always go through the authenticated Next.js API, never straight from the
+   browser to B2. Replace the origins with your Vercel domain and
+   `http://localhost:3000` while developing.
+
+That's it — no lifecycle rules, no public custom domains, no CDN in front of
+the bucket. Back up the bucket together with the database: jointly they are
+the entire library.
 
 ## Deploying on Vercel
 
@@ -207,14 +232,14 @@ Nothing hard-codes `localhost`; the frontend only calls relative paths
 1. Push this repo to GitHub and **import it in Vercel** (Framework: Next.js,
    everything else default — no build/output overrides needed).
 2. Add the **Environment Variables** in the Vercel project settings:
-   `DATABASE_URL`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
-   `R2_BUCKET_NAME`, plus any optional tuning (`MAX_UPLOAD_MB`,
-   `LIBRARY_QUOTA_BYTES`, `TRUST_PROXY=true`, `PUBLIC_ORIGIN`). Any Postgres
-   provider works (Neon, Supabase, RDS, …).
+   `DATABASE_URL`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+   `R2_BUCKET_NAME`, `R2_ENDPOINT`, plus any optional tuning
+   (`MAX_UPLOAD_MB`, `LIBRARY_QUOTA_BYTES`, `TRUST_PROXY=true`,
+   `PUBLIC_ORIGIN`). Any Postgres provider works (Neon, Supabase, RDS, …).
 3. Create the tables once, from your machine with the same `DATABASE_URL`:
    `npm run db:push` (or run it wherever you prefer — it only needs the
    connection string).
-4. Deploy. Set the R2 bucket's CORS policy to include your
+4. Deploy. Set the bucket's CORS rules to include your
    `https://<app>.vercel.app` origin (see above), otherwise browser uploads
    are blocked by the browser — the app will say it can't reach storage.
 5. Open the app and create the owner account.
@@ -225,7 +250,7 @@ Notes:
   the `secure` flag and the app is served over HTTPS.
 - There is intentionally **no `STORAGE_DIR` anymore**: Vercel functions have no
   persistent disk, uploads never touch the local filesystem, and restarts /
-  redeploys lose nothing (bytes are in R2, metadata in Postgres).
+  redeploys lose nothing (bytes are in the bucket, metadata in Postgres).
 - Vercel ends long-lived function executions, which is what the SSE stream is —
   the browser reconnects automatically and resyncs, so nothing is lost (see
   [Real-time sync](#real-time-sync) and [Limitations](#limitations)).
@@ -233,19 +258,19 @@ Notes:
 ## Local development
 
 ```bash
-cp .env.example .env          # DATABASE_URL + R2_* (a real R2 bucket is fine — free tier)
+cp .env.example .env          # DATABASE_URL + R2_* (a real B2 bucket is fine — free tier)
 npm install
 npm run db:push
 npm run dev
 ```
 
-Local dev uses the same R2 bucket mechanics as production. If you prefer to
+Local dev uses the same bucket mechanics as production. If you prefer to
 develop fully offline, point `R2_ENDPOINT` at a local S3-compatible server such
 as MinIO and create the bucket there; everything else is unchanged.
 
 The single-request multipart endpoint (`POST /api/files`) also works locally
 for small files and scripts, but the browser UI always uses the presigned
-direct-to-R2 flow, so UI uploads behave identically in dev and on Vercel.
+direct-to-bucket flow, so UI uploads behave identically in dev and on Vercel.
 
 ## Project structure
 
@@ -304,7 +329,7 @@ so the browser and the Node test suite run the *same* code.
 - **Postgres is the source of truth** for metadata: name, extension, MIME type,
   size, logical relative path, uploader, timestamps, thumbnail info — plus the
   short-lived `pending_uploads` reservations described below.
-- **R2 is the source of truth for bytes**, always at
+- **The bucket is the source of truth for bytes**, always at
   `files/<server-generated-uuid>/<sanitized-name>` for models and
   `thumbnails/<uuid>.<ext>` for thumbnails. A client-supplied filename or path
   never decides where bytes land.
@@ -320,36 +345,37 @@ so the browser and the Node test suite run the *same* code.
 ```
 Upload (browser UI):
   browser ──POST /api/files/presign──► Next.js ──► Postgres (pending_uploads reservation)
-  browser ──PUT bytes directly to R2──► (presigned URL, single key, 5 min, no credentials)
+  browser ──PUT bytes directly to the bucket──► (presigned URL, single key, 5 min, no credentials)
   browser ──POST /api/files/complete──► Next.js verifies object, commits files row
 
 Download / preview / thumbnail:
   browser ──GET /api/files/:id/{raw,download,thumbnail}──► Next.js checks session
-      ──► streams the private R2 object back with correct MIME + disposition
+      ──► streams the private object back with correct MIME + disposition
 ```
 
-- **The bucket is private and stays private.** Browsers never `GET` from R2
-  directly: the authenticated API streams bytes after checking the session, so
-  permission checks, filenames, MIME types and security headers are exactly the
-  same as before. (The storage layer can also mint short-lived presigned *GET*
-  URLs after authorization; the routes stream today because that preserves the
-  existing headers, cookie auth and behaviour bit-for-bit.)
-- **Uploads go direct to R2** because Vercel caps serverless request bodies at
-  a few MB — a 300 MB model could never pass through the function. The server
-  still makes every security decision: session, CSRF, size limits, sanitizing,
-  quota reservation and the object key are all fixed at presign time; the
-  browser only fills the bytes in, and completion verifies existence + exact
-  size before the row is committed.
+- **The bucket is private and stays private.** Browsers never `GET` from the
+  bucket directly: the authenticated API streams bytes after checking the
+  session, so permission checks, filenames, MIME types and security headers
+  are exactly the same as before. (The storage layer can also mint short-lived
+  presigned *GET* URLs after authorization; the routes stream today because
+  that preserves the existing headers, cookie auth and behaviour bit-for-bit.)
+- **Uploads go direct to the bucket** because Vercel caps serverless request
+  bodies at a few MB — a 300 MB model could never pass through the function.
+  The server still makes every security decision: session, CSRF, size limits,
+  sanitizing, quota reservation and the object key are all fixed at presign
+  time; the browser only fills the bytes in, and completion verifies
+  existence + exact size before the row is committed.
 - **A legacy single-request `POST /api/files`** (multipart) is kept for small
-  files, scripts and the E2E suite; it buffers, writes to R2, verifies and
-  commits with the same rollback guarantees. It is subject to the platform's
-  request-body cap, so the UI never uses it.
+  files, scripts and the E2E suite; it buffers, writes to the bucket, verifies
+  and commits with the same rollback guarantees. It is subject to the
+  platform's request-body cap, so the UI never uses it.
 - **No local disk is involved anywhere.** The app writes zero bytes to the
   server filesystem; restarts, redeploys and instance churn lose nothing.
 
 ## Storage consistency
 
-Uploads and deletes are ordered so the database and R2 can never disagree:
+Uploads and deletes are ordered so the database and the bucket can never
+disagree:
 
 **Presigned upload**
 1. The session and CSRF token are checked; the input is validated
@@ -371,10 +397,11 @@ Uploads and deletes are ordered so the database and R2 can never disagree:
 **Delete**
 1. The `files` rows are deleted first. If that fails, nothing was removed —
    bytes untouched, request fails loudly.
-2. The R2 objects (model key + every thumbnail variant) are deleted. R2 has no
-   atomic rename-to-trash, so row-first ordering is the recoverable order: a
-   failure here can only leave orphaned *invisible* bytes (Postgres is the
-   source of truth), never a visible row pointing at missing bytes.
+2. The stored objects (model key + every thumbnail variant) are deleted.
+   Object storage has no atomic rename-to-trash, so row-first ordering is the
+   recoverable order: a failure here can only leave orphaned *invisible* bytes
+   (Postgres is the source of truth), never a visible row pointing at missing
+   bytes.
 3. Orphaned objects are reclaimed by a best-effort sweep (old objects under
    `files/`/`thumbnails/` referenced by neither table), which runs
    probabilistically after uploads.
@@ -395,7 +422,8 @@ reload or a server restart — sees it.
   PNG, WebP, GIF) and stores it as `thumbnails/<id>.<real-ext>` with the
   matching `Content-Type`. A PNG is never written to `<id>.jpg` and never served
   as `image/jpeg`; a data URL that lies about its type is corrected and logged.
-- **Content that is not an image is rejected** (`415`) before it reaches R2.
+- **Content that is not an image is rejected** (`415`) before it reaches
+  storage.
 - Mislabelled objects are repaired on read: a PNG found at `<id>.jpg` is copied
   to `<id>.png`, the DB metadata is corrected, and it is served as `image/png`.
 - Thumbnails are served only to authenticated members, with
@@ -442,8 +470,8 @@ anymore, and resolution never depended on one:
 - A `.gltf` is loaded by resolving each reference against the *shared library*:
   exact relative path → exact file name → unique basename. If two files share a
   basename the app refuses to guess and tells you to keep assets together.
-- Companion files remain ordinary library entries with their own rows and R2
-  objects — the same record-per-file behaviour as before, so they can be
+- Companion files remain ordinary library entries with their own rows and
+  stored objects — the same record-per-file behaviour as before, so they can be
   downloaded, renamed or deleted individually.
 - The resolution algorithm lives in `public/vault/shared.js` and is unit tested
   (`tests/paths.test.mjs`, plus the R2-metadata cases in
@@ -523,7 +551,8 @@ input. The UI's hidden/disabled controls are convenience only.
   `files/<id>/<name>` or `thumbnails/<id>.<ext>` — client input can never become
   an arbitrary key. Client-supplied paths are only used as a *logical* string
   for glTF resolution, with `..` segments removed.
-- **R2 credentials** live only in server-side environment variables. They are
+- **Storage credentials (`R2_*`)** live only in server-side environment
+  variables. They are
   never committed (see `.env.example`), never imported by browser code, and
   never appear in presigned URLs (which carry a signature for one key, not the
   keys themselves). The bucket is private; SDK error detail is logged
@@ -557,8 +586,8 @@ input. The UI's hidden/disabled controls are convenience only.
 | Missing bytes in storage | `404 This file's data is missing from storage on the server.` |
 | Expired upload session | `404 This upload session has expired. Please upload the file again.` |
 | Completed without bytes | `400 No bytes were received for this upload…` |
-| R2 not configured | `503 Object storage is not configured…` (operator action required) |
-| R2 temporarily failing | `502 Object storage is temporarily unavailable…` |
+| Storage not configured | `503 Object storage is not configured…` (operator action required) |
+| Storage temporarily failing | `502 Object storage is temporarily unavailable…` |
 | Corrupt/unsupported model | stored normally; the viewer shows a card explaining it can't be previewed + a download button |
 | Invalid `.gltf` JSON | `"<name>" is not valid glTF JSON.` |
 | Missing `.gltf` companion | `Missing companion file "x.bin". Add that file to the library along with …` |
@@ -606,7 +635,7 @@ npm run test:e2e -- --phase=2
 - `scripts/e2e-test.mjs` drives the real HTTP API with two real accounts: setup
   race, CSRF/origin, invites, uploads, SSE delivery in both directions, preview
   and download bytes, filenames/MIME types, the presigned upload flow
-  (validation, direct-to-R2 round-trip, completion auth, idempotent retry,
+  (validation, direct-to-bucket round-trip, completion auth, idempotent retry,
   complete-without-bytes), thumbnails (including a lying data URL and a
   non-image payload), rename/delete sync, authorization failures, quota, rate
   limiting, password-change revocation, logout, and — in phase 2 — persistence
@@ -617,7 +646,7 @@ npm run test:e2e -- --phase=2
 
 - **Serverless request bodies are small.** Vercel caps function request bodies
   at a few MB, so the legacy single-request `POST /api/files` cannot accept
-  large files there. The browser UI always uses the presigned direct-to-R2
+  large files there. The browser UI always uses the presigned direct-to-bucket
   flow instead, which works up to `MAX_UPLOAD_MB` everywhere.
 - **SSE streams don't live forever on serverless.** Vercel ends idle function
   executions, so a stream is periodically cut and the browser reconnects (with

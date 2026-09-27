@@ -1,15 +1,17 @@
 # Model Vault — hardening & verification report
 
-> **Addendum (2026-09-27, R2 migration).** This report is the point-in-time
-> record of an earlier hardening pass and is kept verbatim below. Since then,
-> binary storage moved from the server filesystem (`STORAGE_DIR`) to a private
-> Cloudflare R2 bucket (see README "Storage architecture"). The guarantees
-> recorded here still hold, with R2-native mechanics: uploads write → verify →
-> insert with object rollback; deletes remove rows first and objects after
-> (R2 has no atomic rename-to-trash; orphaned invisible bytes are swept);
-> quota is accounted from Postgres (`files` + `pending_uploads`) so it holds
-> across serverless instances; browser uploads go direct to R2 via short-lived
-> presigned PUT URLs. The current tests are `tests/r2-storage.test.mjs` (unit)
+> **Addendum (2026-09-27, object storage migration).** This report is the
+> point-in-time record of an earlier hardening pass and is kept verbatim below.
+> Since then, binary storage moved from the server filesystem (`STORAGE_DIR`)
+> to a private Backblaze B2 bucket via the S3-compatible API (see README
+> "Storage architecture"). The guarantees recorded here still hold, with
+> object-storage mechanics: uploads write → verify → insert with object
+> rollback; deletes remove rows first and objects after (object storage has no
+> atomic rename-to-trash; orphaned invisible bytes are swept); quota is
+> accounted from Postgres (`files` + `pending_uploads`) so it holds across
+> serverless instances; browser uploads go direct to the bucket via
+> short-lived presigned PUT URLs. The current tests are
+> `tests/r2-storage.test.mjs` (unit)
 > plus the extended `scripts/e2e-test.mjs` (presigned flow, completion auth).
 
 Code and documentation live in this repo; this file records what was changed,
