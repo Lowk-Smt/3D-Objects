@@ -49,7 +49,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     const mime = getMimeForName(newName);
     const updatedAt = new Date();
 
-    // The bytes on disk keep their original name (storedName); only the
+    // The stored object keeps its original name (storedName); only the
     // logical path used for glTF companion resolution changes.
     await db
       .update(files)

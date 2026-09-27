@@ -242,22 +242,16 @@ export function requireOwner(user: SafeUser) {
   }
 }
 
-export function canUserDeleteFiles(user: SafeUser): boolean {
-  return user.role === "owner" || user.canDelete;
-}
-
-/**
- * Who may create/replace a file's shared thumbnail: the member who uploaded
- * that file, or the workspace owner. Enforced server-side on every write —
- * the frontend only hides the action.
- */
-export function canUserManageThumbnail(
-  user: SafeUser,
-  file: { uploaderId: string | null },
-): boolean {
-  if (user.role === "owner") return true;
-  return !!file.uploaderId && file.uploaderId === user.id;
-}
+// Permission rules live in src/lib/permissions.ts (pure, unit-tested) and are
+// re-exported here so every existing `import { ... } from "@/lib/auth"`
+// keeps working. They are enforced server-side on every write — the frontend
+// only hides the action.
+export {
+  canUserCompleteUpload,
+  canUserDeleteFiles,
+  canUserManageThumbnail,
+  isOwner,
+} from "@/lib/permissions";
 
 export function authErrorResponse(err: unknown): NextResponse | null {
   if (err instanceof AuthError) {

@@ -1,10 +1,7 @@
-import fs from "node:fs";
-import path from "node:path";
-import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
 import { ApiError } from "@/lib/api-helpers";
 import { isSafeFileId, sanitizeStoredName } from "@/lib/files";
-import { fileDir, fileDiskPath } from "@/lib/storage";
+import { R2Error, fileObjectKey, getObjectStore } from "@/lib/r2";
 
 /** Encode a filename for use in Content-Disposition, RFC 5987 safe. */
 function contentDispositionValue(disposition: "inline" | "attachment", filename: string): string {
@@ -24,32 +21,30 @@ export async function streamFileResponse(opts: {
 }): Promise<NextResponse> {
   if (!isSafeFileId(opts.id)) throw new ApiError(400, "Invalid file id.");
 
-  // storedName is sanitized on write and again here, and always resolved
-  // beneath STORAGE_DIR/files/<server-generated id>/.
-  const dir = fileDir(opts.id);
-  const diskPath = fileDiskPath(opts.id, sanitizeStoredName(opts.storedName));
-  if (diskPath !== path.join(dir, path.basename(diskPath))) {
-    throw new ApiError(400, "Invalid file path.");
-  }
+  // storedName is sanitized on write and again here. The key builder rejects
+  // anything that is not a single safe segment, so this can only ever address
+  // files/<server-generated id>/<sanitized name> in the private bucket.
+  const key = fileObjectKey(opts.id, sanitizeStoredName(opts.storedName));
 
-  let stat;
+  let object;
   try {
-    stat = await fs.promises.stat(diskPath);
-  } catch {
+    object = await getObjectStore().getStream(key);
+  } catch (err) {
+    if (err instanceof R2Error && err.status === 503) {
+      throw new ApiError(503, err.message);
+    }
+    console.error(`[serve-file] Failed to load ${key}:`, err);
+    throw new ApiError(502, "Object storage is temporarily unavailable. Please try again in a moment.");
+  }
+
+  if (!object) {
     throw new ApiError(404, "This file's data is missing from storage on the server.");
   }
 
-  if (!stat.isFile()) {
-    throw new ApiError(404, "This file's data is missing from storage on the server.");
-  }
-
-  const nodeStream = fs.createReadStream(diskPath);
-  const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream;
-
-  return new NextResponse(webStream, {
+  return new NextResponse(object.stream, {
     headers: {
       "Content-Type": opts.mime || "application/octet-stream",
-      "Content-Length": String(stat.size),
+      "Content-Length": String(object.size),
       "Content-Disposition": contentDispositionValue(opts.disposition, opts.displayName),
       // Uploaded files are user-supplied content: never let a browser sniff it
       // into something executable, and neutralize any active content (e.g. an

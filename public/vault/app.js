@@ -24,7 +24,7 @@ import { MeshoptSimplifier } from 'meshoptimizer';
 /* ============================================================
    Model Vault — shared multi-user library frontend.
 
-   The backend (Next.js API routes + Postgres + filesystem storage) is the
+   The backend (Next.js API routes + Postgres + R2 object storage) is the
    canonical source of truth. This file is responsible for: auth screens,
    the Three.js viewer, client-side GLB optimization, thumbnail capture,
    search/sort/select UI, and talking to the backend over fetch() + SSE.
@@ -180,41 +180,63 @@ const api = {
 };
 
 function uploadWithProgress(file, relPath, extra, onProgress){
-  return new Promise((resolve, reject) => {
-    const form = new FormData();
-    form.append('file', file, file.name);
-    form.append('name', file.name);
-    form.append('path', relPath || file.name);
-    if (extra && extra.optimized) form.append('optimized', 'true');
-    if (extra && extra.optimizePreset) form.append('preset', extra.optimizePreset);
+  // Presigned upload flow (same signature, same progress reporting, same
+  // result shape as before — only the transport changed):
+  //   1. POST /api/files/presign authorizes the upload and mints a
+  //      short-lived PUT URL for one server-generated object key;
+  //   2. the bytes go directly to object storage with an XHR PUT so the
+  //      progress bar keeps working (the file never passes through the
+  //      serverless function body, which is capped at a few MB);
+  //   3. POST /api/files/complete verifies the object and commits the row.
+  // No storage credentials ever reach the browser: the PUT URL only permits
+  // that single key for a few minutes.
+  const presignBody = {
+    name: file.name,
+    path: relPath || file.name,
+    size: file.size,
+    optimized: !!(extra && extra.optimized),
+    preset: (extra && extra.optimizePreset) || null,
+  };
 
+  const putToStorage = (uploadUrl, contentType) => new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/files');
-    xhr.withCredentials = true;
-    const csrf = getCookie('mv_csrf');
-    if (csrf) xhr.setRequestHeader('x-csrf-token', csrf);
+    xhr.open('PUT', uploadUrl);
+    // Cross-origin request to object storage: no cookies needed (the
+    // signature is in the URL) and none are sent.
+    xhr.withCredentials = false;
+    if (contentType) xhr.setRequestHeader('Content-Type', contentType);
 
     xhr.upload.onprogress = (e) => {
       if (onProgress && e.lengthComputable) onProgress(e.loaded / e.total);
     };
 
     xhr.onload = () => {
-      let body = null;
-      try { body = JSON.parse(xhr.responseText); } catch { /* ignore */ }
-
-      if (xhr.status === 401){ onSessionExpired(); reject(new ApiClientError(401, 'Session expired')); return; }
-
-      if (xhr.status >= 200 && xhr.status < 300){
-        resolve(body.file);
-      } else {
-        reject(new ApiClientError(xhr.status, (body && body.error) || `Upload failed (${xhr.status})`));
-      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new ApiClientError(xhr.status, `The direct upload to storage failed (${xhr.status}). Please try again.`));
     };
 
-    xhr.onerror = () => { setOffline(true); reject(new ApiClientError(0, "Can't reach the server to upload this file.")); };
+    xhr.onerror = () => {
+      reject(new ApiClientError(0, "Can't reach object storage to upload this file. Check your connection and try again."));
+    };
 
-    xhr.send(form);
+    xhr.send(file);
   });
+
+  return (async () => {
+    const presigned = await apiFetch('/api/files/presign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(presignBody),
+    });
+    await putToStorage(presigned.uploadUrl, presigned.contentType);
+    if (onProgress) onProgress(1);
+    const completed = await apiFetch('/api/files/complete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: presigned.id }),
+    });
+    return completed.file;
+  })();
 }
 
 /* ============================================================
@@ -1197,6 +1219,7 @@ async function syncFileList(){
 
 function connectEvents(){
   if (eventSource) eventSource.close();
+  startFallbackPoll();
 
   eventSource = new EventSource('/api/events');
 
@@ -1272,6 +1295,23 @@ function connectEvents(){
 
 function disconnectEvents(){
   if (eventSource){ eventSource.close(); eventSource = null; }
+}
+
+// Fallback poll for deployments where a serverless platform ends idle SSE
+// streams (or cross-instance fan-out is unavailable): while the stream is
+// not connected, the library is re-read every 30s so no change goes
+// unnoticed for long. Invisible — no UI change — and a no-op whenever the
+// live stream is healthy or the user is logged out.
+let fallbackPoll = null;
+
+function startFallbackPoll(){
+  if (fallbackPoll) return;
+  fallbackPoll = setInterval(() => {
+    if (!state.currentUser) return;
+    if (!eventSource || eventSource.readyState !== EventSource.OPEN){
+      syncFileList();
+    }
+  }, 30000);
 }
 
 let sessionCheckInFlight = false;

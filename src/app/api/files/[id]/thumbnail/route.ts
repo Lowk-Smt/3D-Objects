@@ -25,7 +25,7 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     await requireSession(req);
 
     // A thumbnail is only served for a file that actually exists in the
-    // library, and the id is validated before it ever reaches the filesystem.
+    // library, and the id is validated before it ever reaches object storage.
     const row = await loadFile(id);
     if (!row.hasThumbnail) throw new ApiError(404, "No thumbnail available.");
 

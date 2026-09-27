@@ -5,7 +5,7 @@ import { db } from "@/db";
 import { files } from "@/db/schema";
 import { requireCsrf, requireSession } from "@/lib/auth";
 import { ApiError, handleApiError } from "@/lib/api-helpers";
-import { ensureStorageDirs, MAX_UPLOAD_BYTES } from "@/lib/config";
+import { MAX_UPLOAD_BYTES } from "@/lib/config";
 import {
   getExt,
   getMimeForName,
@@ -19,7 +19,7 @@ import {
   releaseUploadBytes,
   reserveUploadBytes,
   saveFileData,
-  scheduleTrashSweep,
+  scheduleStorageSweep,
 } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await requireSession(req);
     requireCsrf(req, ctx);
-    scheduleTrashSweep();
+    scheduleStorageSweep();
 
     const declaredLength = Number(req.headers.get("content-length") || 0);
     if (declaredLength && declaredLength > MAX_UPLOAD_BYTES) {
@@ -65,7 +65,7 @@ export async function POST(req: NextRequest) {
 
     // The display name and the relative path are only ever hints from the
     // browser: both are sanitized here, and neither is trusted for anything
-    // that determines where bytes land on disk (that is the server-side UUID).
+    // that determines where bytes land in object storage (that is the server-side UUID).
     const rawName = String(form.get("name") || (blob as File).name || "file");
     if (rawName.length > 512) throw new ApiError(400, "File name is too long.");
     const originalName = sanitizeDisplayName(rawName);
@@ -79,7 +79,6 @@ export async function POST(req: NextRequest) {
     const presetRaw = form.get("preset") ? String(form.get("preset")) : "";
     const optimizePreset = optimized && OPTIMIZE_PRESETS.has(presetRaw) ? presetRaw : null;
 
-    ensureStorageDirs();
     await reserveUploadBytes(blob.size);
     reservedBytes = blob.size;
 
@@ -122,7 +121,7 @@ export async function POST(req: NextRequest) {
       await db.insert(files).values(record);
     } catch (err) {
       console.error(`[files] Insert failed for upload ${id}; rolling back stored bytes:`, err);
-      await discardFileData(id);
+      await discardFileData(id, storedName);
       reservedBytes = 0;
       releaseUploadBytes(blob.size);
       if (err instanceof ApiError) throw err;
