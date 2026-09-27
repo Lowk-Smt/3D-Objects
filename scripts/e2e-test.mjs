@@ -4,8 +4,8 @@
  *
  * Drives the real HTTP API (auth, uploads, downloads, thumbnails, deletes,
  * authorization, quota, rate limiting, SSE) against a running server, exactly
- * the way two browsers would. Nothing is mocked: Postgres, the filesystem and
- * the SSE stream are all the real thing.
+ * the way two browsers would. Nothing is mocked: Postgres, Cloudflare R2
+ * object storage and the SSE stream are all the real thing.
  *
  * Usage (fresh database required for phase 1):
  *   node scripts/e2e-test.mjs --phase=1        # everything, no restart
@@ -776,6 +776,147 @@ async function phase1() {
     const response = await request(ownerJar, "/api/files/00000000-0000-0000-0000-000000000000/raw");
     assert.equal(response.status, 404);
     assert.match((await json(response)).error, /not found/i);
+  });
+
+  section("Presigned uploads (direct-to-R2 flow)");
+  await test("presign requires authentication and a CSRF token", async () => {
+    const anon = await request(null, "/api/files/presign", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "a.glb", path: "a.glb", size: 64 }),
+    });
+    assert.equal(anon.status, 401);
+
+    const noCsrf = await fetch(`${BASE}/api/files/presign`, {
+      method: "POST",
+      headers: {
+        Cookie: `mv_session=${ownerJar.get("mv_session")}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: "a.glb", path: "a.glb", size: 64 }),
+    });
+    assert.equal(noCsrf.status, 403, "a session alone must not authorize a presign");
+  });
+
+  await test("presign validates its input before touching storage", async () => {
+    const cases = [
+      [{ name: "a.glb", path: "a.glb", size: 0 }, 400],
+      [{ name: "a.glb", path: "a.glb", size: -5 }, 400],
+      [{ name: "a.glb", path: "a.glb", size: "huge" }, 400],
+      [{ name: "a.glb", path: "a.glb", size: 3.5 }, 400],
+      [{ name: "a.glb", path: "a.glb", size: 10 * 1024 ** 4 }, 413], // 10TB always exceeds MAX_UPLOAD_MB
+      [{ name: "", path: "a.glb", size: 64 }, 400],
+      [{ name: "x".repeat(513), path: "a.glb", size: 64 }, 400],
+      [{ name: "a.glb", path: "x".repeat(1025), size: 64 }, 400],
+    ];
+    for (const [payload, expected] of cases) {
+      const response = await request(ownerJar, "/api/files/presign", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(response.status, expected, `${JSON.stringify(payload)} -> ${response.status}`);
+    }
+  });
+
+  await test("completing an unknown upload reports 404, a malformed id 400", async () => {
+    const unknown = await request(ownerJar, "/api/files/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "00000000-0000-0000-0000-000000000000" }),
+    });
+    assert.equal(unknown.status, 404);
+
+    const malformed = await request(ownerJar, "/api/files/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "not-an-id!!" }),
+    });
+    assert.equal(malformed.status, 400);
+  });
+
+  await test("the presigned flow round-trips bytes through object storage", async () => {
+    const bytes = makeGlb(1024, 21);
+    const presign = await request(ownerJar, "/api/files/presign", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "presigned.glb", path: "presigned.glb", size: bytes.length }),
+    });
+    if (presign.status === 503) {
+      console.log("    (skipped: R2 object storage is not configured on this server)");
+      return;
+    }
+    assert.equal(presign.status, 201, JSON.stringify(await json(presign.clone())));
+    const { id, uploadUrl, contentType } = await json(presign);
+    assert.ok(id && uploadUrl && contentType);
+    // The URL grants one key for a few minutes — never credentials.
+    assert.ok(!/secret|accesskey|password/i.test(uploadUrl), uploadUrl);
+
+    // Step 2: bytes go directly to R2, exactly like the browser's XHR PUT.
+    const put = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { "Content-Type": contentType },
+      body: bytes,
+    });
+    assert.ok(put.ok, `direct PUT to storage failed with ${put.status}`);
+
+    // Another member cannot hijack the reservation — only the starter (or an
+    // owner completing their own) may finish it.
+    const hijack = await request(memberJar, "/api/files/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    assert.equal(hijack.status, 403);
+
+    const complete = await request(ownerJar, "/api/files/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    assert.equal(complete.status, 201, JSON.stringify(await json(complete.clone())));
+    const file = (await json(complete)).file;
+    assert.equal(file.name, "presigned.glb");
+    assert.equal(file.size, bytes.length);
+    assert.equal(file.uploaderName, OWNER.username);
+
+    // The committed bytes are really there, for every member.
+    const raw = await request(memberJar, `/api/files/${file.id}/raw`);
+    assert.equal(raw.status, 200);
+    assert.equal(Buffer.from(await raw.arrayBuffer()).equals(bytes), true);
+
+    // Completion is idempotent: a retried complete returns the same file.
+    const retry = await request(ownerJar, "/api/files/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    assert.equal(retry.status, 201);
+
+    await request(ownerJar, `/api/files/${file.id}`, { method: "DELETE" });
+  });
+
+  await test("completing without uploading any bytes is rejected cleanly", async () => {
+    const presign = await request(ownerJar, "/api/files/presign", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "ghost.glb", path: "ghost.glb", size: 512 }),
+    });
+    if (presign.status === 503) {
+      console.log("    (skipped: R2 object storage is not configured on this server)");
+      return;
+    }
+    assert.equal(presign.status, 201);
+    const { id } = await json(presign);
+
+    // No PUT happened: completion must fail and release the reservation.
+    const complete = await request(ownerJar, "/api/files/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    assert.equal(complete.status, 400);
+    assert.match((await json(complete)).error, /no bytes/i);
   });
 
   section("Storage quota");

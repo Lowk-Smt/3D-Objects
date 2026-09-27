@@ -38,8 +38,8 @@ export function getMimeForName(name: string): string {
 
 /**
  * File ids are server-generated UUIDs. Validating the shape before the value
- * is ever used to build a filesystem path is defense-in-depth against
- * traversal (a DB lookup already gates access, but never trust a path part).
+ * is ever used to build an object-storage key is defense-in-depth (a DB
+ * lookup already gates access, but never trust a key part).
  */
 const FILE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -48,10 +48,10 @@ export function isSafeFileId(id: unknown): id is string {
 }
 
 /**
- * Sanitize a user-supplied filename for safe storage on disk. This never
+ * Sanitize a user-supplied filename for safe object storage. This never
  * affects the "display name" stored in the database — it only controls the
- * name of the file actually written under STORAGE_DIR, which always lives
- * inside an id-scoped directory anyway (defense in depth against traversal).
+ * final segment of the R2 object key (`files/<id>/<storedName>`), which is
+ * always scoped to a server-generated id anyway (defense in depth).
  */
 export function sanitizeStoredName(name: string): string {
   const base =

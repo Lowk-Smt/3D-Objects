@@ -38,8 +38,9 @@ export const sessions = pgTable("sessions", {
 });
 
 /**
- * Shared library file metadata. The binary itself lives on disk under
- * STORAGE_DIR/files/<id>/<storedName> — never inside Postgres.
+ * Shared library file metadata. The binary itself lives in the private R2
+ * bucket under `files/<id>/<storedName>` — never inside Postgres and never on
+ * a server-local filesystem (Vercel functions have no persistent disk).
  */
 export const files = pgTable("files", {
   id: text("id").primaryKey(),
@@ -50,7 +51,7 @@ export const files = pgTable("files", {
   // Logical relative path (e.g. "textures/albedo.png") preserved so that
   // .gltf files can be resolved against their companion assets.
   path: text("path").notNull(),
-  // Sanitized name actually used on disk (never trusted for traversal).
+  // Sanitized name used as the final R2 key segment (never trusted for traversal).
   storedName: text("stored_name").notNull(),
   uploaderId: text("uploader_id").references(() => users.id, { onDelete: "set null" }),
   // Denormalized so the uploader's name still displays after account removal.
@@ -58,12 +59,47 @@ export const files = pgTable("files", {
   uploadedAt: timestamp("uploaded_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   hasThumbnail: boolean("has_thumbnail").notNull().default(false),
-  // Extension + content type of the thumbnail actually stored on disk, so the
-  // bytes on disk, their extension and the Content-Type header always agree
+  // Extension + content type of the thumbnail actually stored in R2, so the
+  // stored bytes, their extension and the Content-Type header always agree
   // (JPEG today, but a PNG/WebP thumbnail is stored as one rather than being
   // mislabelled as .jpg/image/jpeg).
   thumbExt: text("thumb_ext").notNull().default("jpg"),
   thumbMime: text("thumb_mime").notNull().default("image/jpeg"),
   optimized: boolean("optimized").notNull().default(false),
   optimizePreset: text("optimize_preset"),
+});
+
+/**
+ * In-flight presigned uploads.
+ *
+ * The browser's upload flow is: POST /api/files/presign (server authorizes,
+ * reserves quota and mints a short-lived PUT URL) → PUT bytes directly to R2
+ * → POST /api/files/complete (server verifies the object and commits the
+ * `files` row). This table is the reservation between the first and last
+ * step:
+ *
+ *  - it holds quota accounting that works across serverless instances (each
+ *    instance's memory is useless for coordination, Postgres is shared);
+ *  - the `id` is the future `files.id`, so completion is idempotent and the
+ *    R2 object key is bound to the reservation at presign time;
+ *  - rows expire (see PENDING_UPLOAD_TTL); expiry deletes the reservation
+ *    and any bytes the browser managed to upload without completing.
+ *
+ * All display/path fields are server-sanitized at presign time; completion
+ * copies them verbatim and trusts nothing else from the client.
+ */
+export const pendingUploads = pgTable("pending_uploads", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  ext: text("ext").notNull().default(""),
+  mime: text("mime").notNull().default("application/octet-stream"),
+  size: bigint("size", { mode: "number" }).notNull(),
+  path: text("path").notNull(),
+  storedName: text("stored_name").notNull(),
+  uploaderId: text("uploader_id").references(() => users.id, { onDelete: "set null" }),
+  uploaderName: text("uploader_name").notNull().default("Unknown"),
+  optimized: boolean("optimized").notNull().default(false),
+  optimizePreset: text("optimize_preset"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

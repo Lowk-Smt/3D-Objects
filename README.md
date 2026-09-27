@@ -6,10 +6,16 @@ Anyone in the workspace can upload `.glb`/`.gltf`/`.obj`/`.stl`/`.fbx`/`.ply`
 optionally optimize GLBs before sharing them, and see everyone else's
 uploads/renames/deletes/thumbnails appear live — no manual refresh required.
 
-It is deliberately a *small* app: one Next.js server process, one Postgres
-database, one storage directory. Everything below is written for that
-deployment shape, and the few places where that assumption shows are called out
+It is deliberately a *small* app with a boring, durable shape: one Next.js app,
+one Postgres database for metadata, one private Cloudflare R2 bucket for bytes.
+That shape is exactly what the app deploys as — on Vercel, on a VPS, or on your
+laptop — and the few places where the deployment model shows are called out
 under [Limitations](#limitations).
+
+```
+Browser ──► Next.js (Vercel) ──┬──► PostgreSQL      metadata (users, sessions, files)
+                               └──► Cloudflare R2   model binaries + thumbnails (private bucket)
+```
 
 ---
 
@@ -19,9 +25,12 @@ under [Limitations](#limitations).
 - [Sharing a library with a few people](#sharing-a-library-with-a-few-people)
 - [The viewer](#the-viewer)
 - [Configuration](#configuration)
-- [Deploying it later](#deploying-it-later)
+- [Setting up Cloudflare R2](#setting-up-cloudflare-r2)
+- [Deploying on Vercel](#deploying-on-vercel)
+- [Local development](#local-development)
 - [Project structure](#project-structure)
 - [The library model](#the-library-model)
+- [Storage architecture](#storage-architecture)
 - [Storage consistency](#storage-consistency)
 - [Thumbnails](#thumbnails)
 - [Optimization](#optimization)
@@ -37,8 +46,11 @@ under [Limitations](#limitations).
 
 ## Quick start
 
+You need a Postgres database and a Cloudflare R2 bucket (both have free tiers —
+see [Setting up Cloudflare R2](#setting-up-cloudflare-r2)).
+
 ```bash
-cp .env.example .env          # then edit DATABASE_URL
+cp .env.example .env          # then set DATABASE_URL + the R2_* variables
 npm install
 npm run db:push               # create/upgrade the tables (drizzle-kit push)
 npm run build
@@ -50,7 +62,7 @@ Open `http://localhost:3000`. With no accounts in the database the app shows
 owner. Afterwards only the owner can invite more members (Members → Invite).
 
 Point every computer/phone at the **same URL** — they all share one Postgres
-database and one `STORAGE_DIR`, so they are looking at the same library.
+database and one R2 bucket, so they are looking at the same library.
 
 ## Sharing a library with a few people
 
@@ -102,28 +114,28 @@ replaced with a real backend:
 
 | Concern | Original file | Model Vault |
 |---|---|---|
-| Source of truth | Browser IndexedDB | PostgreSQL (metadata) + server filesystem (bytes) |
+| Source of truth | Browser IndexedDB | PostgreSQL (metadata) + Cloudflare R2 (bytes) |
 | Multi-user | Not possible | Any number of accounts on one shared library |
 | Live updates | None | Server-Sent Events pushed to every open tab |
 | Auth | None | Username + password (bcrypt), server-side sessions |
 | Permissions | None | Owner / member, per-member delete permission |
-| Thumbnails | Local data URL | Generated in the browser, stored on the server, served to everyone |
-| Downloads | From a local blob | Streamed from the server with the original filename + MIME type |
+| Thumbnails | Local data URL | Generated in the browser, stored in R2, served to everyone |
+| Downloads | From a local blob | Streamed from R2 through the authenticated API with the original filename + MIME type |
 | Storage limits | None | `MAX_UPLOAD_MB` per file, optional `LIBRARY_QUOTA_BYTES` for the workspace |
 
-### Why Next.js + Postgres, and SSE rather than WebSockets
+### Why Next.js + Postgres + R2, and SSE rather than WebSockets
 
-Model Vault runs on a platform that provisions a Next.js (App Router) +
-PostgreSQL application and validates it with `next build` / `next start`, so the
-backend is implemented as Next.js route handlers with Postgres via Drizzle
-instead of a separate Python process with SQLite. If you self-host it, the same
-architecture works unchanged against any Postgres instance and any platform
-that can run `npm run start` behind a reverse proxy.
+Model Vault is a Next.js (App Router) application: the backend is route handlers
+with Postgres via Drizzle for metadata and Cloudflare R2 (S3-compatible object
+storage) for bytes. That split is what makes the app deployable to Vercel —
+serverless functions have no persistent disk, so bytes live in R2 while the
+database stays the source of truth for everything else.
 
 Real-time sync uses **Server-Sent Events**: Next.js route handlers can return a
-long-lived streaming `Response` with no custom server, `EventSource` reconnects
-by itself in the browser, and this app only ever needs server→client push. That
-keeps the implementation dependency-free and reliable.
+streaming `Response` with no custom server, `EventSource` reconnects by itself
+in the browser, and this app only ever needs server→client push. Cross-instance
+fan-out on serverless goes over Postgres `LISTEN`/`NOTIFY` (see
+[Real-time sync](#real-time-sync)) — still no extra infrastructure.
 
 ## Configuration
 
@@ -133,38 +145,107 @@ full list. The important ones:
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | *(required)* | Postgres connection string. The app refuses to boot without it. |
-| `STORAGE_DIR` | `./data` | Where uploaded bytes + thumbnails live. **Must be persistent.** |
+| `R2_ACCOUNT_ID` | *(required)* | Cloudflare account ID. |
+| `R2_ACCESS_KEY_ID` | *(required)* | R2 S3 API access key (Object Read & Write on the bucket). |
+| `R2_SECRET_ACCESS_KEY` | *(required)* | R2 S3 API secret. Never committed, never sent to the browser. |
+| `R2_BUCKET_NAME` | *(required)* | Private bucket for model binaries + thumbnails. |
+| `R2_ENDPOINT` | `https://<account>.r2.cloudflarestorage.com` | Override only for S3-compatible local dev (e.g. MinIO). |
 | `MAX_UPLOAD_MB` | `300` | Per-file upload limit, enforced server-side. |
 | `LIBRARY_QUOTA_BYTES` | *(unset)* | Workspace storage cap. When set, uploads that would exceed it are rejected with 413. |
+| `PENDING_UPLOAD_TTL_MINUTES` | `30` | How long a presigned upload reservation stays valid. |
 | `SESSION_TTL_DAYS` | `30` | Login lifetime. |
 | `LOGIN_MAX_FAILURES_PER_ACCOUNT` | `8` | Failed logins per account before throttling. |
 | `LOGIN_MAX_FAILURES_PER_IP` | `40` | Failed logins per client address before throttling. |
-| `TRUST_PROXY` | `false` | Honour `X-Forwarded-For` for rate-limit keys. |
+| `TRUST_PROXY` | `false` | Honour `X-Forwarded-For` for rate-limit keys (`true` recommended on Vercel). |
 | `PUBLIC_ORIGIN` | *(unset)* | Optional extra allowed origin for the CSRF check when running behind a proxy. |
 
 No secret is hard-coded anywhere. Sessions are opaque 256-bit random tokens
 stored in Postgres, so there is deliberately **no session signing secret** to
 configure, rotate or leak.
 
-`.env` / `.env.local` are git-ignored; the repo does not ship a `data/`
-directory, and `.gitignore` keeps uploaded models out of version control.
+`.env` / `.env.local` are git-ignored. On Vercel, set variables in the project
+settings instead of committing a file.
 
-## Deploying it later
+## Setting up Cloudflare R2
+
+1. **Create the bucket.** In the Cloudflare dashboard go to **R2 Object
+   Storage → Create bucket**, pick a name (e.g. `model-vault`), and leave it
+   **private** — do *not* enable public access or a public custom domain. The
+   app authorizes every byte through its own API; the bucket must never be
+   world-readable.
+2. **Create an API token.** Go to **R2 → Manage R2 API Tokens → Create API
+   token** with **Object Read & Write** permission scoped to that bucket. Copy
+   the **Access Key ID** and **Secret Access Key** into `R2_ACCESS_KEY_ID` /
+   `R2_SECRET_ACCESS_KEY`, and your account ID into `R2_ACCOUNT_ID`.
+3. **Configure CORS** so browsers can `PUT` uploads directly to R2. In the
+   bucket's **Settings → CORS policy**, allow your app's origin (add your
+   Vercel domain *and* `http://localhost:3000` while developing):
+
+   ```json
+   [
+     {
+       "AllowedOrigins": ["https://your-app.vercel.app", "http://localhost:3000"],
+       "AllowedMethods": ["PUT"],
+       "AllowedHeaders": ["content-type"],
+       "ExposeHeaders": ["ETag"],
+       "MaxAgeSeconds": 3600
+     }
+   ]
+   ```
+
+   Only `PUT` from your own origins is needed — reads always go through the
+   authenticated Next.js API, never straight from the browser to R2.
+
+That's it — no lifecycle rules, no public domains, no workers. Back up the
+bucket together with the database: jointly they are the entire library.
+
+## Deploying on Vercel
 
 Nothing hard-codes `localhost`; the frontend only calls relative paths
 (`/api/...`), so it works under any domain.
 
-1. Point `DATABASE_URL` at your Postgres and `STORAGE_DIR` at a **persistent
-   volume** — the database and the storage directory are the entire state of
-   the library. Back up both.
-2. `npm run build && npm run start` behind any reverse proxy (nginx, Caddy, a
-   VPS, a container platform, …).
-3. Set `NODE_ENV=production` so session cookies get the `secure` flag, and
-   serve the app over HTTPS.
-4. If the proxy rewrites the `Host` header, the CSRF origin check already
-   accepts `X-Forwarded-Host` and `PUBLIC_ORIGIN`, so no extra configuration is
-   needed; set `TRUST_PROXY=true` if you also want per-IP rate limiting to see
-   real client addresses.
+1. Push this repo to GitHub and **import it in Vercel** (Framework: Next.js,
+   everything else default — no build/output overrides needed).
+2. Add the **Environment Variables** in the Vercel project settings:
+   `DATABASE_URL`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+   `R2_BUCKET_NAME`, plus any optional tuning (`MAX_UPLOAD_MB`,
+   `LIBRARY_QUOTA_BYTES`, `TRUST_PROXY=true`, `PUBLIC_ORIGIN`). Any Postgres
+   provider works (Neon, Supabase, RDS, …).
+3. Create the tables once, from your machine with the same `DATABASE_URL`:
+   `npm run db:push` (or run it wherever you prefer — it only needs the
+   connection string).
+4. Deploy. Set the R2 bucket's CORS policy to include your
+   `https://<app>.vercel.app` origin (see above), otherwise browser uploads
+   are blocked by the browser — the app will say it can't reach storage.
+5. Open the app and create the owner account.
+
+Notes:
+
+- `NODE_ENV=production` is set by Vercel automatically, so session cookies get
+  the `secure` flag and the app is served over HTTPS.
+- There is intentionally **no `STORAGE_DIR` anymore**: Vercel functions have no
+  persistent disk, uploads never touch the local filesystem, and restarts /
+  redeploys lose nothing (bytes are in R2, metadata in Postgres).
+- Vercel ends long-lived function executions, which is what the SSE stream is —
+  the browser reconnects automatically and resyncs, so nothing is lost (see
+  [Real-time sync](#real-time-sync) and [Limitations](#limitations)).
+
+## Local development
+
+```bash
+cp .env.example .env          # DATABASE_URL + R2_* (a real R2 bucket is fine — free tier)
+npm install
+npm run db:push
+npm run dev
+```
+
+Local dev uses the same R2 bucket mechanics as production. If you prefer to
+develop fully offline, point `R2_ENDPOINT` at a local S3-compatible server such
+as MinIO and create the bucket there; everything else is unchanged.
+
+The single-request multipart endpoint (`POST /api/files`) also works locally
+for small files and scripts, but the browser UI always uses the presigned
+direct-to-R2 flow, so UI uploads behave identically in dev and on Vercel.
 
 ## Project structure
 
@@ -177,21 +258,26 @@ src/
       auth/                 # status, setup, login, logout, me, password
       users/                # list/invite/update/remove members (owner-only writes)
       files/                # list/upload, [id] rename/delete, raw, download, thumbnail
+      files/presign/        # step 1 of browser uploads: authorize + mint a PUT URL
+      files/complete/       # step 3 of browser uploads: verify + commit the row
       files/batch-delete/   # multi-select delete
       stats/                # storage usage for the sidebar meter
       events/               # Server-Sent Events stream (live sync)
       health/
   db/
-    schema.ts               # users, sessions, files
+    schema.ts               # users, sessions, files, pending_uploads
     index.ts
   lib/
-    auth.ts                 # sessions, password hashing, CSRF, permissions, revocation
-    config.ts               # env-driven configuration (storage, limits, quota, rate limits)
-    storage.ts              # every filesystem operation + DB/disk consistency + quota
+    auth.ts                 # sessions, password hashing, CSRF, revocation (+ permission re-exports)
+    permissions.ts          # pure permission rules (unit-tested)
+    config.ts               # env-driven configuration (limits, quota, sessions, rate limits)
+    r2.ts                   # the ONLY R2 client: keys, put/get/delete/presign, error mapping
+    storage.ts              # bytes+metadata consistency, presigned flow, thumbnails, quota, sweeps
+    uploads.ts              # pure upload validation + quota math (unit-tested)
     files.ts                # filename sanitizing, MIME map, image sniffing, wire format
     rate-limit.ts           # in-memory login brute-force protection
-    serve-file.ts           # streaming responses with correct headers
-    events.ts               # in-process pub/sub for SSE
+    serve-file.ts           # authenticated streaming responses with correct headers
+    events.ts               # in-process bus + Postgres LISTEN/NOTIFY fan-out for SSE
     api-helpers.ts          # ApiError + one error-to-response mapping
 public/vault/
   styles.css                # the original dark "Model Vault" visual design
@@ -202,10 +288,7 @@ scripts/
 tests/
   paths.test.mjs            # glTF path/MIME/download-name resolution
   server-helpers.test.mjs   # server-side sanitizers, sniffers, wire format
-data/                       # created automatically, never committed
-  files/<id>/<name>         # uploaded bytes, one directory per file id
-  thumbnails/<id>.<ext>     # generated thumbnails
-  trash/                    # transient: bytes parked during a delete
+  r2-storage.test.mjs       # R2 keys, validation, permissions, quota, rollback, errors
 ```
 
 The frontend is still a plain ES module (`public/vault/app.js`) loaded through a
@@ -219,39 +302,82 @@ so the browser and the Node test suite run the *same* code.
 ## The library model
 
 - **Postgres is the source of truth** for metadata: name, extension, MIME type,
-  size, logical relative path, uploader, timestamps, thumbnail info.
-- **The filesystem is the source of truth for bytes**, always at
-  `STORAGE_DIR/files/<server-generated-uuid>/<sanitized-name>`. A client-supplied
-  filename or path never decides where bytes land.
+  size, logical relative path, uploader, timestamps, thumbnail info — plus the
+  short-lived `pending_uploads` reservations described below.
+- **R2 is the source of truth for bytes**, always at
+  `files/<server-generated-uuid>/<sanitized-name>` for models and
+  `thumbnails/<uuid>.<ext>` for thumbnails. A client-supplied filename or path
+  never decides where bytes land.
 - Every page load and every SSE (re)connect re-reads the full list from
   `GET /api/files`. Nothing is cached in `localStorage`, IndexedDB or
   `BroadcastChannel`; a browser that has been offline simply resyncs.
 - A rename updates the metadata (and therefore the download filename and the
-  path used to resolve glTF companions) but never renames the bytes on disk, so
-  a rename cannot break anything and cannot be used to escape the storage root.
+  path used to resolve glTF companions) but never moves the object, so
+  a rename cannot break anything and cannot escape the key scope.
+
+## Storage architecture
+
+```
+Upload (browser UI):
+  browser ──POST /api/files/presign──► Next.js ──► Postgres (pending_uploads reservation)
+  browser ──PUT bytes directly to R2──► (presigned URL, single key, 5 min, no credentials)
+  browser ──POST /api/files/complete──► Next.js verifies object, commits files row
+
+Download / preview / thumbnail:
+  browser ──GET /api/files/:id/{raw,download,thumbnail}──► Next.js checks session
+      ──► streams the private R2 object back with correct MIME + disposition
+```
+
+- **The bucket is private and stays private.** Browsers never `GET` from R2
+  directly: the authenticated API streams bytes after checking the session, so
+  permission checks, filenames, MIME types and security headers are exactly the
+  same as before. (The storage layer can also mint short-lived presigned *GET*
+  URLs after authorization; the routes stream today because that preserves the
+  existing headers, cookie auth and behaviour bit-for-bit.)
+- **Uploads go direct to R2** because Vercel caps serverless request bodies at
+  a few MB — a 300 MB model could never pass through the function. The server
+  still makes every security decision: session, CSRF, size limits, sanitizing,
+  quota reservation and the object key are all fixed at presign time; the
+  browser only fills the bytes in, and completion verifies existence + exact
+  size before the row is committed.
+- **A legacy single-request `POST /api/files`** (multipart) is kept for small
+  files, scripts and the E2E suite; it buffers, writes to R2, verifies and
+  commits with the same rollback guarantees. It is subject to the platform's
+  request-body cap, so the UI never uses it.
+- **No local disk is involved anywhere.** The app writes zero bytes to the
+  server filesystem; restarts, redeploys and instance churn lose nothing.
 
 ## Storage consistency
 
-Uploads and deletes are ordered so the database and the disk can never disagree:
+Uploads and deletes are ordered so the database and R2 can never disagree:
 
-**Upload**
-1. The session and CSRF token are checked.
-2. Size is validated against `MAX_UPLOAD_MB`, then quota bytes are *reserved*
-   (an in-process reservation, so two simultaneous uploads cannot both pass the
-   quota check with the same free space).
-3. Bytes are written to `files/<uuid>/<name>`, and the file size is verified
-   after the write.
-4. Only then is the row inserted. If the insert fails, the bytes are deleted
-   and the caller gets a clear 500 — **no orphaned files, no phantom rows**.
+**Presigned upload**
+1. The session and CSRF token are checked; the input is validated
+   (`MAX_UPLOAD_MB`, name/path lengths, preset whitelist).
+2. Quota is checked against Postgres (committed files + live reservations) and
+   a `pending_uploads` reservation is inserted — this is the cross-instance
+   quota hold.
+3. A presigned PUT URL is minted for exactly `files/<uuid>/<sanitized-name>`
+   with the file's MIME type baked into the signature. If minting fails, the
+   reservation is removed.
+4. The browser PUTs the bytes. Completion then HEADs the object (must exist,
+   must be exactly the declared size), re-checks quota, and inserts the
+   `files` row. If the insert fails, the object is deleted — **no orphaned
+   objects, no phantom rows**. Completion is idempotent: retries return the
+   committed file.
+5. Reservations expire (`PENDING_UPLOAD_TTL_MINUTES`); expiry deletes the
+   reservation and any bytes the browser uploaded without completing.
 
 **Delete**
-1. The bytes (and any thumbnail) are moved to `STORAGE_DIR/trash/` with an
-   atomic `rename` — nothing is unlinked yet.
-2. The row is deleted.
-3. The trashed bytes are purged. If a purge fails, the delete still succeeded
-   and the leftovers are swept on the next server start.
-4. If step 2 fails, the bytes are renamed back and the request fails with
-   "nothing was removed" — never a half-deleted file.
+1. The `files` rows are deleted first. If that fails, nothing was removed —
+   bytes untouched, request fails loudly.
+2. The R2 objects (model key + every thumbnail variant) are deleted. R2 has no
+   atomic rename-to-trash, so row-first ordering is the recoverable order: a
+   failure here can only leave orphaned *invisible* bytes (Postgres is the
+   source of truth), never a visible row pointing at missing bytes.
+3. Orphaned objects are reclaimed by a best-effort sweep (old objects under
+   `files/`/`thumbnails/` referenced by neither table), which runs
+   probabilistically after uploads.
 
 Failures are never swallowed: storage errors, database errors and cleanup
 problems are logged server-side and surfaced as explicit HTTP errors.
@@ -266,17 +392,17 @@ reload or a server restart — sees it.
   owner, may create or replace its thumbnail. Anyone else gets `403`, whether or
   not the UI showed them the button.
 - **The bytes decide the format**: the server sniffs the decoded image (JPEG,
-  PNG, WebP, GIF) and stores it as `<id>.<real-ext>` with the matching
-  `Content-Type`. A PNG is never written to `<id>.jpg` and never served as
-  `image/jpeg`; a data URL that lies about its type is corrected and logged.
-- **Content that is not an image is rejected** (`415`) before it reaches disk.
-- Legacy rows created before this rule existed are repaired on read: a PNG
-  found in `<id>.jpg` is renamed to `<id>.png`, the DB metadata is corrected,
-  and it is served as `image/png`.
+  PNG, WebP, GIF) and stores it as `thumbnails/<id>.<real-ext>` with the
+  matching `Content-Type`. A PNG is never written to `<id>.jpg` and never served
+  as `image/jpeg`; a data URL that lies about its type is corrected and logged.
+- **Content that is not an image is rejected** (`415`) before it reaches R2.
+- Mislabelled objects are repaired on read: a PNG found at `<id>.jpg` is copied
+  to `<id>.png`, the DB metadata is corrected, and it is served as `image/png`.
 - Thumbnails are served only to authenticated members, with
   `X-Content-Type-Options: nosniff` and `Cache-Control: private`.
-- Writing is atomic (temp file + rename) and the stale file for a different
-  extension is removed afterwards, so a JPEG→PNG change never leaves both.
+- Replacing a thumbnail writes the new object and removes stale variants, so a
+  JPEG→PNG change never leaves both behind. If the metadata write fails, the
+  new object is removed again (rollback).
 
 ## Optimization
 
@@ -306,7 +432,9 @@ What is actually verified to happen to the written file (checked against
 ## glTF companion files
 
 `.gltf` files reference buffers (`barrel.bin`) and textures
-(`textures/albedo.png`) by relative path. Model Vault preserves that structure:
+(`textures/albedo.png`) by relative path. Model Vault preserves that structure
+in **Postgres logical-path metadata** — there is no physical directory layout
+anymore, and resolution never depended on one:
 
 - When files are added with drag & drop, folders are walked (not flattened), so
   a dropped `scene/` folder keeps paths like `scene/textures/albedo.png`; the
@@ -314,11 +442,12 @@ What is actually verified to happen to the written file (checked against
 - A `.gltf` is loaded by resolving each reference against the *shared library*:
   exact relative path → exact file name → unique basename. If two files share a
   basename the app refuses to guess and tells you to keep assets together.
-- Companion files remain ordinary library entries with their own rows and bytes
-  — the same record-per-file behaviour as before, so they can be downloaded,
-  renamed or deleted individually.
+- Companion files remain ordinary library entries with their own rows and R2
+  objects — the same record-per-file behaviour as before, so they can be
+  downloaded, renamed or deleted individually.
 - The resolution algorithm lives in `public/vault/shared.js` and is unit tested
-  (`tests/paths.test.mjs`); the E2E test uploads a real `.gltf` + `.bin` +
+  (`tests/paths.test.mjs`, plus the R2-metadata cases in
+  `tests/r2-storage.test.mjs`); the E2E test uploads a real `.gltf` + `.bin` +
   texture bundle and asserts every reference resolves to the right file id.
 
 ## Real-time sync
@@ -329,8 +458,17 @@ channel.
 - `GET /api/events` is an authenticated Server-Sent Events stream. Uploads,
   renames, deletes, thumbnail changes and member changes are broadcast to every
   connected browser, which applies them to the list immediately.
+- Broadcasts fan out **in-process and over Postgres `LISTEN`/`NOTIFY`**, so on
+  Vercel an upload handled by one instance still reaches streams held by other
+  instances — with no extra infrastructure. If `LISTEN` is unavailable (e.g. a
+  transaction-mode pooler), the stream transparently falls back to in-process
+  delivery plus the resync below.
 - Every (re)connect re-fetches the full library, so events missed while a tab
-  was closed are picked up on the next connection.
+  was closed — or while a serverless platform ended an idle stream — are picked
+  up on the next connection. The server also sends `retry: 5000` so reconnects
+  are polite, and the client re-reads the library every 30 s *only while the
+  stream is down* as a fallback. Nothing is ever lost; at worst it arrives on
+  the next resync.
 - A heartbeat every 25 s both keeps proxies from closing the stream and
   re-checks session liveness: if the account's sessions were revoked (password
   changed, account removed), the stream sends `session-expired` and closes, and
@@ -339,7 +477,8 @@ channel.
   and the tab retries automatically (SSE reconnect, or an explicit re-check when
   the browser gives up on the stream).
 
-There is no polling, no `localStorage` state and no fake refresh anywhere.
+There is no `localStorage` state and no fake refresh anywhere; the only polling
+is the invisible disconnected-fallback described above.
 
 ## Permissions
 
@@ -348,6 +487,7 @@ There is no polling, no `localStorage` state and no fake refresh anywhere.
 | Upload / preview / download / rename | ✅ | ✅ |
 | Delete single files / batch delete | ✅ | only with "Can delete files" |
 | Replace a file's thumbnail | ✅ (any file) | only files they uploaded |
+| Complete a presigned upload | ✅ (own reservations, or any as owner) | only reservations they started |
 | Invite / remove members, change roles or delete permission | ✅ | ❌ |
 | Change own password | ✅ | ✅ |
 
@@ -376,17 +516,25 @@ input. The UI's hidden/disabled controls are convenience only.
 - **Login brute force**: failed logins are counted per account and per client
   address in memory (see `LOGIN_MAX_FAILURES_*`); past the limit the endpoint
   answers `429` with `Retry-After` and does no password work. A successful login
-  clears that account's counters. No database table, no external service.
-- **Path traversal**: file ids must match `^[A-Za-z0-9_-]{1,64}$`, stored names
-  are sanitized and re-sanitized when a path is built, and every path is
-  resolved under `STORAGE_DIR/files/<id>/`. Client-supplied paths are only used
-  as a *logical* string for glTF resolution, with `..` segments removed.
-- **Uploads**: `MAX_UPLOAD_MB` is enforced from `Content-Length` and from the
-  received bytes; empty files, missing fields and oversized payloads get
-  explicit `400`/`413` responses. Quota enforcement happens before the bytes are
-  accepted.
-- **Serving user content**: downloads are streamed with the stored MIME type,
-  an RFC 5987 `Content-Disposition`, `X-Content-Type-Options: nosniff` and a
+  clears that account's counters. No database table, no external service. (On
+  serverless the counters are per-instance — see [Limitations](#limitations).)
+- **Object keys**: file ids must match `^[A-Za-z0-9_-]{1,64}$`, stored names are
+  sanitized and re-validated when a key is built, and keys are always exactly
+  `files/<id>/<name>` or `thumbnails/<id>.<ext>` — client input can never become
+  an arbitrary key. Client-supplied paths are only used as a *logical* string
+  for glTF resolution, with `..` segments removed.
+- **R2 credentials** live only in server-side environment variables. They are
+  never committed (see `.env.example`), never imported by browser code, and
+  never appear in presigned URLs (which carry a signature for one key, not the
+  keys themselves). The bucket is private; SDK error detail is logged
+  server-side and never echoed to clients.
+- **Uploads**: `MAX_UPLOAD_MB` is enforced at presign time and at completion
+  (declared size vs stored bytes, byte-exact); empty files and oversized
+  payloads get explicit `400`/`413` responses. Quota is reserved at presign
+  time and re-checked at completion.
+- **Serving user content**: downloads are streamed from the private bucket
+  through the authenticated API with the stored MIME type, an RFC 5987
+  `Content-Disposition`, `X-Content-Type-Options: nosniff` and a
   `default-src 'none'; sandbox` CSP; responses are `private, no-cache`.
 - **Error leakage**: unexpected exceptions are logged server-side and returned
   as a generic 500; expected failures carry a specific, user-readable message.
@@ -401,18 +549,22 @@ input. The UI's hidden/disabled controls are convenience only.
 | Expired/revoked session | `401`, the tab returns to the login screen, live stream closed |
 | Missing/invalid CSRF | `403 Missing or invalid CSRF token.` |
 | Cross-origin state change | `403 Cross-origin request blocked.` |
-| Not allowed (delete/thumbnail/members) | `403` with the specific rule that blocked it |
+| Not allowed (delete/thumbnail/members/complete) | `403` with the specific rule that blocked it |
 | Oversized upload | `413` naming the configured limit |
 | Over quota | `413` naming the limit, current usage and the upload size |
 | Empty/missing file | `400 The uploaded file is empty.` / `No file was provided.` |
 | Unknown or deleted id | `404 File not found. It may have been deleted…` |
-| Missing bytes on disk | `404 This file's data is missing from storage on the server.` |
+| Missing bytes in storage | `404 This file's data is missing from storage on the server.` |
+| Expired upload session | `404 This upload session has expired. Please upload the file again.` |
+| Completed without bytes | `400 No bytes were received for this upload…` |
+| R2 not configured | `503 Object storage is not configured…` (operator action required) |
+| R2 temporarily failing | `502 Object storage is temporarily unavailable…` |
 | Corrupt/unsupported model | stored normally; the viewer shows a card explaining it can't be previewed + a download button |
 | Invalid `.gltf` JSON | `"<name>" is not valid glTF JSON.` |
 | Missing `.gltf` companion | `Missing companion file "x.bin". Add that file to the library along with …` |
 | Ambiguous companion match | explains that several files match and to keep assets together |
 | Database unavailable | `503 The database is unavailable…` |
-| Filesystem write/delete failure | `500` naming the failure, with a guarantee that nothing was half-saved |
+| Storage write/delete failure | `500` naming the failure, with a guarantee that nothing was half-saved |
 | Server restart / dropped SSE | connection indicator shows "Reconnecting…", then reconnects and re-syncs |
 | Duplicate filename | both files are kept as separate entries (uploader is shown); the UI reports skipped duplicates of the *same name and size* |
 
@@ -443,24 +595,42 @@ npm run test:e2e -- --phase=2
 - `tests/server-helpers.test.mjs` covers the server-side sanitizers,
   path-traversal neutralization, id validation, image sniffing and data-URL
   validation, and asserts the client and server MIME tables stay identical.
+- `tests/r2-storage.test.mjs` covers the object-storage layer without network
+  or database access: R2 key generation (including hostile filenames through
+  sanitize → key), presign input validation, the permission matrix (delete,
+  thumbnail, upload completion), thumbnail keying + repair, R2 error mapping
+  (including that messages never carry credentials), quota boundary math, glTF
+  resolution from Postgres logical paths, and rollback behaviour (failed writes
+  and verification mismatches leave nothing behind; deletes report per-key
+  failures and fall back to key-by-key removal).
 - `scripts/e2e-test.mjs` drives the real HTTP API with two real accounts: setup
   race, CSRF/origin, invites, uploads, SSE delivery in both directions, preview
-  and download bytes, filenames/MIME types, thumbnails (including a lying data
-  URL and a non-image payload), rename/delete sync, authorization failures,
-  quota, rate limiting, password-change revocation, logout, and — in phase 2 —
-  persistence of sessions, metadata, bytes, thumbnails and companion resolution
-  across a server restart.
+  and download bytes, filenames/MIME types, the presigned upload flow
+  (validation, direct-to-R2 round-trip, completion auth, idempotent retry,
+  complete-without-bytes), thumbnails (including a lying data URL and a
+  non-image payload), rename/delete sync, authorization failures, quota, rate
+  limiting, password-change revocation, logout, and — in phase 2 — persistence
+  of sessions, metadata, bytes, thumbnails and companion resolution across a
+  server restart.
 
 ## Limitations
 
-- **Single-process by design.** The SSE fan-out and the login rate limiter keep
-  their state in process memory. That is correct and sufficient for one server
-  process (the way this app is meant to run). If you ever run several instances
-  behind a load balancer you would need shared pub/sub (e.g. Postgres
-  `LISTEN`/`NOTIFY`) and a shared rate-limit store.
-- **Large uploads are buffered in memory once** while the multipart body is
-  parsed (Node's `request.formData()`), so a multi-GB file needs matched RAM.
-  `MAX_UPLOAD_MB` is the guard rail; chunked uploads would be the next step.
+- **Serverless request bodies are small.** Vercel caps function request bodies
+  at a few MB, so the legacy single-request `POST /api/files` cannot accept
+  large files there. The browser UI always uses the presigned direct-to-R2
+  flow instead, which works up to `MAX_UPLOAD_MB` everywhere.
+- **SSE streams don't live forever on serverless.** Vercel ends idle function
+  executions, so a stream is periodically cut and the browser reconnects (with
+  a 5 s back-off) and re-reads the full library — updates are never lost, at
+  worst they arrive on the next resync, and a 30 s fallback poll covers the
+  client while disconnected. Cross-instance delivery uses Postgres
+  `LISTEN`/`NOTIFY`; transaction-mode poolers don't support `LISTEN`, in which
+  case delivery degrades gracefully to in-process events plus the resync.
+- **Login rate limiting is per-instance on serverless.** Each instance keeps
+  its own counters, so a distributed guessing attack is throttled less
+  strictly than on a single server. The per-account limit still bites as soon
+  as attempts concentrate, and bcrypt cost 12 keeps each guess expensive — but
+  treat the limiter as mitigation, not a vault door, and use strong passwords.
 - **No public sign-up** — by design. Only an owner can create accounts.
 - **Optimization is GLB-only and client-side** (as in the original app). If the
   optimized result would be larger than the original, the original is uploaded.
