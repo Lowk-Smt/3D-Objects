@@ -10,6 +10,12 @@ import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
+/* ---- pure helpers shared with the server/tests (public/vault/shared.js) ---- */
+import {
+  MIME_BY_EXT, getExt, getMimeForName, normalizePath, basename, dirname, decodeUri,
+  isInlineOrRemoteUri, sanitizeBaseName, findReferencedFile, getDownloadName
+} from './shared.js';
+
 /* ---- optimization pipeline imports ---- */
 import { WebIO } from '@gltf-transform/core';
 import { simplify, prune, dedup } from '@gltf-transform/functions';
@@ -48,21 +54,6 @@ function fmtSize(b){
 
 const fmtDate = t => new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
 
-function getExt(name){
-  const i = String(name).lastIndexOf('.');
-  return i < 0 ? '' : String(name).slice(i + 1).toLowerCase();
-}
-
-const MIME_BY_EXT = {
-  glb: 'model/gltf-binary', gltf: 'model/gltf+json', obj: 'text/plain', mtl: 'text/plain',
-  stl: 'model/stl', fbx: 'application/octet-stream', ply: 'application/octet-stream', bin: 'application/octet-stream',
-  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
-  bmp: 'image/bmp', svg: 'image/svg+xml', json: 'application/json', zip: 'application/zip', txt: 'text/plain',
-  ktx2: 'image/ktx2'
-};
-
-function getMimeForName(name){ return MIME_BY_EXT[getExt(name)] || 'application/octet-stream'; }
-
 function presetLabel(key){
   switch (key){
     case 'high': return 'High quality';
@@ -76,72 +67,6 @@ function retypeBlob(blob, name){
   const wanted = getMimeForName(name);
   if (blob.type === wanted) return blob;
   return new Blob([blob], { type: wanted });
-}
-
-/* ---------- path helpers (used for glTF companion-file resolution) ---------- */
-
-function normalizePath(path){
-  const parts = String(path || '').replace(/\\/g, '/').split('/');
-  const out = [];
-  for (const part of parts){
-    if (!part || part === '.') continue;
-    if (part === '..'){ out.pop(); continue; }
-    out.push(part);
-  }
-  return out.join('/');
-}
-
-function basename(path){
-  const p = normalizePath(path);
-  const i = p.lastIndexOf('/');
-  return i < 0 ? p : p.slice(i + 1);
-}
-
-function dirname(path){
-  const p = normalizePath(path);
-  const i = p.lastIndexOf('/');
-  return i < 0 ? '' : p.slice(0, i);
-}
-
-function decodeUri(uri){ try { return decodeURIComponent(uri); } catch { return uri; } }
-
-function isInlineOrRemoteUri(uri){ return /^(?:data:|blob:|https?:|file:|ftp:)/i.test(uri); }
-
-/*
-  Resolve an asset referenced by a .gltf file against every file currently
-  known in the shared library (matches the original single-user behavior,
-  just backed by server metadata instead of IndexedDB).
-*/
-function findReferencedFile(modelMeta, uri){
-  const decoded = decodeUri(uri);
-  const cleaned = normalizePath(decoded);
-  const modelPath = normalizePath(modelMeta.path || modelMeta.name);
-  const modelDir = dirname(modelPath);
-  const relativeCandidate = normalizePath(modelDir ? `${modelDir}/${cleaned}` : cleaned);
-
-  const exact = state.files.find(f => normalizePath(f.path || f.name) === relativeCandidate);
-  if (exact) return exact;
-
-  const exactName = state.files.find(f => normalizePath(f.name) === cleaned);
-  if (exactName) return exactName;
-
-  const base = basename(cleaned);
-  const basenameMatches = state.files.filter(f => basename(f.path || f.name) === base);
-
-  if (basenameMatches.length === 1) return basenameMatches[0];
-  if (basenameMatches.length > 1){
-    throw new Error(
-      `Multiple library files match "${uri}". Keep the model and its assets in the same folder when importing.`
-    );
-  }
-  return null;
-}
-
-function getDownloadName(meta){
-  let name = String(meta.name || 'download').trim();
-  if (!name) name = 'download';
-  if (!getExt(name) && meta.ext) name += '.' + meta.ext;
-  return name;
 }
 
 /* ============================================================
@@ -224,6 +149,10 @@ const api = {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password })
   }),
   logout: () => apiFetch('/api/auth/logout', { method: 'POST' }),
+  changePassword: (currentPassword, newPassword) => apiFetch('/api/auth/password', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentPassword, newPassword })
+  }),
 
   listFiles: () => apiFetch('/api/files').then(d => d.files),
   fetchRaw: (id) => apiFetch(`/api/files/${id}/raw`).then(r => r.blob()),
@@ -295,6 +224,11 @@ function uploadWithProgress(file, relPath, extra, onProgress){
    and strips non-essential generator/tool metadata instead.
    ============================================================ */
 
+// Stamped into the optimized file's asset.generator so a shared model always
+// says where it came from, instead of advertising whatever exporter (or AI
+// tool) produced the upload.
+const GENERATOR_TAG = 'Model Vault 1.0 (glTF-Transform)';
+
 const OPTIMIZE_PRESETS = {
   high:     { ratio: 0.7,  error: 0.0005, textureSize: 2048 },
   balanced: { ratio: 0.5,  error: 0.0005, textureSize: 2048 },
@@ -360,13 +294,22 @@ async function optimizeGLBBlob(blob, onProgress, presetKey = 'balanced', cancelT
   await document.transform(dedup());
   checkCancelled();
 
-  // Remove non-essential generator/tool metadata WITHOUT touching meaningful
-  // names. Only nameless objects get a readable fallback name so nothing in
-  // the scene becomes unidentifiable.
+  // Remove tool/export metadata WITHOUT touching meaningful names.
+  //
+  // Verified behaviour (asserted by tests/optimizer.test.mjs, documented in
+  // the README's "Optimization" section):
+  //  - the glTF writer always emits an `asset.generator`, and glTF-Transform's
+  //    reader never carries the *original* exporter string into the document,
+  //    so the uploaded file is deliberately re-tagged as Model Vault's output;
+  //  - `asset.extras` (and every node/mesh/material/texture/scene `extras`
+  //    block) is dropped from the written file, so tool-specific metadata does
+  //    not travel with the shared model;
+  //  - existing names are kept byte-for-byte. Only properties that were saved
+  //    without any name get a neutral placeholder, so they stay identifiable.
   report('Removing tool metadata…', 92);
   const asset = document.getRoot().getAsset();
   if (asset){
-    delete asset.generator;
+    asset.generator = GENERATOR_TAG;
     delete asset.extras;
   }
   document.getRoot().setExtras({});
@@ -438,6 +381,19 @@ function askToOptimize(file){
           progressText.textContent = step;
           fillEl.style.width = pct + '%';
         }, presetKey, cancelToken);
+
+        // Never make a file bigger by "optimizing" it — the original is the
+        // safe fallback, and the user is told why.
+        if (optimizedBlob.size >= file.size){
+          cleanup();
+          flash(
+            `Optimizing "${file.name}" would have made it larger ` +
+            `(${fmtSize(file.size)} → ${fmtSize(optimizedBlob.size)}), so the original was uploaded unchanged.`,
+            5200
+          );
+          resolve({ file, optimized: false, preset: null });
+          return;
+        }
 
         const optimizedFile = new File([optimizedBlob], file.name, { type: 'model/gltf-binary', lastModified: Date.now() });
 
@@ -654,7 +610,7 @@ async function createDependencyUrl(modelMeta, uri, cache, createdUrls){
   const key = decodeUri(uri);
   if (cache.has(key)) return cache.get(key);
 
-  const dependencyMeta = findReferencedFile(modelMeta, key);
+  const dependencyMeta = findReferencedFile(state.files, modelMeta, key);
   if (!dependencyMeta){
     throw new Error(`Missing companion file "${key}". Add that file to the library along with "${modelMeta.name}".`);
   }
@@ -854,7 +810,7 @@ function renderList(){
 
       return `
         <div class="item ${file.id === state.activeId ? 'active' : ''} ${selected ? 'sel' : ''}" data-id="${file.id}">
-          <div class="badge">${file.thumb ? `<img src="${file.thumb}" alt="" loading="lazy">` : esc(ext)}</div>
+          <div class="badge">${file.thumb ? `<img src="${esc(file.thumb)}" alt="" loading="lazy">` : esc(ext)}</div>
           <div class="info">
             <div class="fname" title="${esc(file.name)}">${esc(file.name)}</div>
             <div class="fsub">
@@ -961,7 +917,9 @@ async function openModel(meta){
   setStatus('');
   needsRender = true;
 
-  if (!meta.thumb){
+  // Thumbnails are shared with the whole workspace, so only the uploader (or
+  // the owner) may create/replace one — the API enforces the same rule.
+  if (!meta.thumb && canManageThumbnail(meta)){
     requestAnimationFrame(async () => {
       if (token !== previewToken) return;
       try {
@@ -969,13 +927,29 @@ async function openModel(meta){
         await api.saveThumbnail(meta.id, thumb);
         meta.thumb = thumb;
         meta.updatedAt = Date.now();
-        const imageWrap = listEl.querySelector(`.item[data-id="${meta.id}"] .badge`);
-        if (imageWrap) imageWrap.innerHTML = `<img src="${thumb}" alt="" loading="lazy">`;
+        renderThumbBadge(meta.id, thumb);
       } catch (error){
         console.warn('Thumbnail upload failed:', error);
+        if (error && error.status !== 401){
+          flash('Preview thumbnail was not saved: ' + (error.message || 'unknown error'));
+        }
       }
     });
   }
+}
+
+function canManageThumbnail(meta){
+  const u = state.currentUser;
+  if (!u || !meta) return false;
+  return u.role === 'owner' || (!!meta.uploaderId && meta.uploaderId === u.id);
+}
+
+/** Repaints just one list item's thumbnail instead of re-rendering the list. */
+function renderThumbBadge(id, url){
+  const item = Array.from(listEl.querySelectorAll('.item')).find(el => el.dataset.id === id);
+  if (!item) return;
+  const wrap = item.querySelector('.badge');
+  if (wrap) wrap.innerHTML = `<img src="${esc(url)}" alt="" loading="lazy">`;
 }
 
 /* ============================================================
@@ -1001,7 +975,7 @@ async function renameFile(meta){
   const entered = prompt('Rename file', originalBase);
   if (entered === null) return;
 
-  let base = entered.trim().replace(/[<>:"/\\|?*\x00-\x1F]/g, '');
+  let base = sanitizeBaseName(entered);
   if (!base){ flashError('Invalid file name'); return; }
 
   const newName = originalExt ? `${base}.${originalExt}` : base;
@@ -1126,7 +1100,7 @@ function mapServerFile(f){
   };
 }
 
-async function addFiles(fileList){
+async function addFiles(fileList, relativePaths){
   const fileArray = Array.from(fileList || []);
   if (!fileArray.length) return;
 
@@ -1155,7 +1129,10 @@ async function addFiles(fileList){
     setStatus(`Uploading ${i + 1} / ${fileArray.length}…`);
 
     try {
-      const relPath = file.webkitRelativePath || file.name;
+      // Relative paths matter for .gltf files: they are how companion .bin /
+      // texture references are resolved in the shared library. They come from
+      // the folder drag-and-drop walk, or from a webkitdirectory input.
+      const relPath = (relativePaths && relativePaths.get(file)) || file.webkitRelativePath || file.name;
       const serverMeta = await api.upload(file, relPath, wasOptimized ? { optimized: true, optimizePreset: optimizePresetUsed } : {}, (pct) => {
         setStatus(`Uploading ${i + 1} / ${fileArray.length}… ${Math.round(pct * 100)}%`);
       });
@@ -1173,7 +1150,7 @@ async function addFiles(fileList){
   setStatus('');
 
   let message = `Uploaded ${added.length} file${added.length === 1 ? '' : 's'}`;
-  if (skipped) message += ` · skipped ${skipped} duplicate${skipped === 1 ? '' : 's'}`;
+  if (skipped) message += ` · skipped ${skipped} duplicate${skipped === 1 ? '' : 's'} (same name and size already in the library)`;
   if (cancelledCount) message += ` · cancelled ${cancelledCount}`;
   if (failed) message += ` · ${failed} failed`;
 
@@ -1226,13 +1203,29 @@ function connectEvents(){
   eventSource.onopen = () => {
     setOffline(false);
     setConn('ok', 'Live sync connected');
-    syncFileList();
+    // The stream may have been down while other people changed the library,
+    // so the full list is re-read from the server on every (re)connect.
+    resyncAfterReconnect();
   };
 
   eventSource.onerror = () => {
     if (!state.currentUser) return;
-    setConn('warn', 'Reconnecting…');
+    // readyState CLOSED means the browser gave up (e.g. the server answered
+    // 401), as opposed to a transient drop where it reconnects on its own.
+    if (eventSource && eventSource.readyState === EventSource.CLOSED){
+      setConn('bad', 'Live sync offline');
+      handleStreamClosed();
+    } else {
+      setConn('warn', 'Reconnecting…');
+    }
   };
+
+  // The server closes the stream when a session is revoked (password change,
+  // removed account) so a stale tab cannot keep receiving live updates.
+  eventSource.addEventListener('session-expired', () => {
+    disconnectEvents();
+    onSessionExpired('Your session is no longer valid. Please log in again.');
+  });
 
   eventSource.addEventListener('file-added', (e) => {
     const payload = JSON.parse(e.data);
@@ -1240,7 +1233,8 @@ function connectEvents(){
     renderList();
     updateUsage();
     if (payload.uploaderId !== (state.currentUser && state.currentUser.id)){
-      flash(`${esc(payload.uploaderName)} added "${esc(payload.name)}"`);
+      // flash() writes via textContent — escaping here would show raw entities.
+      flash(`${payload.uploaderName || 'Someone'} added "${payload.name}"`);
     }
   });
 
@@ -1279,6 +1273,36 @@ function connectEvents(){
 function disconnectEvents(){
   if (eventSource){ eventSource.close(); eventSource = null; }
 }
+
+let sessionCheckInFlight = false;
+
+/**
+ * Called when the event stream closes for good. Re-checks the session: if it
+ * is gone we return to the login screen, otherwise we reconnect (a server
+ * restart drops the stream but the session in Postgres is still valid).
+ */
+async function handleStreamClosed(){
+  if (sessionCheckInFlight || !state.currentUser) return;
+  sessionCheckInFlight = true;
+  try {
+    const response = await api.me();
+    if (response.status === 401){
+      onSessionExpired('Your session expired. Please log in again.');
+      return;
+    }
+    if (response.ok){
+      setConn('warn', 'Reconnecting…');
+      connectEvents();
+    }
+  } catch {
+    setConn('warn', 'Reconnecting…');
+  } finally {
+    sessionCheckInFlight = false;
+  }
+}
+
+/** Re-syncs the whole library from the server (used after reconnects). */
+async function resyncAfterReconnect(){ await syncFileList(); }
 
 /* ============================================================
    MEMBERS / PERMISSIONS UI
@@ -1402,19 +1426,34 @@ function applyCurrentUser(user){
   badge.classList.toggle('owner', user.role === 'owner');
 }
 
-function onSessionExpired(){
-  if (sessionExpiredHandled) return;
-  sessionExpiredHandled = true;
+/**
+ * Returns the UI to a logged-out state and shows the login screen. Shared by
+ * explicit logout, an expired/revoked session, and a password change.
+ */
+function resetToLoggedOut(message){
   disconnectEvents();
   state.currentUser = null;
   state.files = [];
   state.activeId = null;
+  state.selected.clear();
+  state.selectMode = false;
   clearModel();
+  resetCamera();
   showEmpty();
+  renderList();
   $('userBox').classList.add('hidden');
+  $('selBar').classList.add('hidden');
   setConn('bad', 'Logged out');
+  $('loginUsername').value = '';
+  $('loginPassword').value = '';
   showAuthOverlay('loginPane');
-  flashError('Your session expired. Please log in again.');
+  if (message) flashError(message, 6000);
+}
+
+function onSessionExpired(message){
+  if (sessionExpiredHandled) return;
+  sessionExpiredHandled = true;
+  resetToLoggedOut(message || 'Your session expired. Please log in again.');
 }
 
 async function startApp(user){
@@ -1459,18 +1498,38 @@ $('loginForm').addEventListener('submit', async (e) => {
 });
 
 $('logoutBtn').addEventListener('click', async () => {
-  try { await api.logout(); } catch { /* ignore */ }
-  disconnectEvents();
-  state.currentUser = null;
-  state.files = [];
-  state.activeId = null;
-  clearModel();
-  resetCamera();
-  showEmpty();
-  $('userBox').classList.add('hidden');
-  $('loginUsername').value = '';
-  $('loginPassword').value = '';
-  showAuthOverlay('loginPane');
+  try { await api.logout(); } catch { /* ignore — we log out locally regardless */ }
+  resetToLoggedOut('Logged out.');
+});
+
+/* ---------- change own password ---------- */
+
+$('pwForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+
+  const errorEl = $('pwError');
+  const currentPassword = $('pwCurrent').value;
+  const newPassword = $('pwNew').value;
+  errorEl.classList.add('hidden');
+
+  if (newPassword.length < 8){
+    errorEl.textContent = 'New password must be at least 8 characters.';
+    errorEl.classList.remove('hidden');
+    return;
+  }
+
+  try {
+    await api.changePassword(currentPassword, newPassword);
+    $('pwCurrent').value = '';
+    $('pwNew').value = '';
+    $('membersModal').classList.remove('show');
+    // Changing a password revokes every session for this account, including
+    // this one — so log in again with the new password.
+    resetToLoggedOut('Password changed. Please log in again with your new password.');
+  } catch (err){
+    errorEl.textContent = err.message || 'Could not change your password.';
+    errorEl.classList.remove('hidden');
+  }
 });
 
 /* ============================================================
@@ -1582,10 +1641,83 @@ window.addEventListener('drop', event => {
   dragDepth = 0;
   dropOverlay.classList.remove('show');
   if (!state.currentUser) return;
-  if (event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files.length){
-    addFiles(event.dataTransfer.files);
+
+  const transfer = event.dataTransfer;
+  if (!transfer) return;
+  if (!transfer.files || !transfer.files.length){
+    if (transfer.items && transfer.items.length) flashError('No files were found in what you dropped.');
+    return;
   }
+
+  // Snapshot synchronously: webkitGetAsEntry() and the file list are only
+  // valid during the drop event itself.
+  const flatFiles = Array.from(transfer.files);
+  const entries = collectEntryRoots(transfer);
+
+  // Plain files: upload exactly as before.
+  if (!entries.length || !entries.some(entry => entry.isDirectory)){
+    addFiles(flatFiles, null);
+    return;
+  }
+
+  // A folder was dropped: walk it so .gltf companion files keep their real
+  // relative paths (textures/albedo.png, barrel.bin, …) in the library.
+  setStatus('Reading dropped folder…');
+  resolveEntries(entries)
+    .then(result => {
+      setStatus('');
+      if (result && result.files.length) addFiles(result.files, result.paths);
+      else addFiles(flatFiles, null);
+    })
+    .catch(err => {
+      console.warn('Folder drop failed, falling back to the flat file list:', err);
+      setStatus('');
+      addFiles(flatFiles, null);
+    });
 });
+
+function collectEntryRoots(transfer){
+  const roots = [];
+  try {
+    for (const item of transfer.items){
+      if (!item || item.kind !== 'file' || typeof item.webkitGetAsEntry !== 'function') continue;
+      const entry = item.webkitGetAsEntry();
+      if (entry) roots.push(entry);
+    }
+  } catch { /* fall back to the plain file list */ }
+  return roots;
+}
+
+async function resolveEntries(roots){
+  const collected = [];
+  let failed = 0;
+
+  const walk = (entry, prefix) => new Promise(resolve => {
+    if (entry.isFile){
+      entry.file(
+        file => { collected.push({ file, path: prefix + entry.name }); resolve(); },
+        () => { failed++; resolve(); }
+      );
+      return;
+    }
+    if (!entry.isDirectory){ resolve(); return; }
+
+    const reader = entry.createReader();
+    const readBatch = () => reader.readEntries(async batch => {
+      if (!batch.length){ resolve(); return; }
+      for (const child of batch) await walk(child, prefix + entry.name + '/');
+      readBatch(); // readEntries returns at most ~100 entries per call
+    }, () => resolve());
+    readBatch();
+  });
+
+  for (const root of roots) await walk(root, '');
+  if (failed || !collected.length) return null;
+
+  const paths = new Map();
+  for (const item of collected) paths.set(item.file, item.path);
+  return { files: collected.map(item => item.file), paths };
+}
 
 /* ---------- keyboard shortcuts ---------- */
 

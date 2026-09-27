@@ -1,0 +1,21 @@
+# dependencies
+/node_modules
+
+# next.js build output
+/.next
+/out
+/build
+
+# uploaded binaries + generated thumbnails (never commit the library)
+/data
+
+# secrets / local configuration — never commit these
+.env
+.env.*
+!.env.example
+
+# logs & tooling caches
+*.log
+.DS_Store
+*.tsbuildinfo
+next-env.d.ts

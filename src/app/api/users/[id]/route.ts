@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { eq, and, ne } from "drizzle-orm";
 import { db } from "@/db";
 import { users } from "@/db/schema";
-import { hashPassword, requireCsrf, requireOwner, requireSession } from "@/lib/auth";
+import { hashPassword, requireCsrf, requireOwner, requireSession, revokeUserSessions } from "@/lib/auth";
 import { handleApiError, ApiError } from "@/lib/api-helpers";
 import { broadcast } from "@/lib/events";
 
@@ -44,11 +44,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       updates.role = body.role;
     }
 
+    let passwordChanged = false;
     if (typeof body?.password === "string" && body.password.length > 0) {
       if (body.password.length < 8) {
         throw new ApiError(400, "Password must be at least 8 characters.");
       }
       updates.passwordHash = await hashPassword(body.password);
+      passwordChanged = true;
     }
 
     if (Object.keys(updates).length === 0) {
@@ -56,6 +58,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     }
 
     await db.update(users).set(updates).where(eq(users.id, id));
+
+    // Resetting someone's password must not leave their old logins working:
+    // every existing session for that account is revoked immediately.
+    let sessionsRevoked = 0;
+    if (passwordChanged) {
+      sessionsRevoked = await revokeUserSessions(id);
+    }
 
     const updated = (await db
       .select({ id: users.id, username: users.username, role: users.role, canDelete: users.canDelete, createdAt: users.createdAt })
@@ -65,7 +74,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
     broadcast("member-changed", { type: "updated", member: updated });
 
-    return NextResponse.json({ user: updated });
+    return NextResponse.json({ user: updated, sessionsRevoked });
   } catch (err) {
     return handleApiError(err);
   }

@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
-import { eq } from "drizzle-orm";
+import { eq, lt } from "drizzle-orm";
 import { db } from "@/db";
 import { sessions, users } from "@/db/schema";
 import { IS_PRODUCTION, SESSION_TTL_MS } from "@/lib/config";
@@ -12,9 +12,12 @@ export const CSRF_COOKIE = "mv_csrf";
 
 export class AuthError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  headers?: Record<string, string>;
+
+  constructor(status: number, message: string, headers?: Record<string, string>) {
     super(message);
     this.status = status;
+    this.headers = headers;
   }
 }
 
@@ -92,6 +95,26 @@ export async function destroySession(sessionId: string) {
   await db.delete(sessions).where(eq(sessions.id, sessionId));
 }
 
+/**
+ * Revokes every server-side session belonging to a user. Called whenever a
+ * password changes (by the user themselves or by an owner resetting it), so
+ * old cookies stop working immediately instead of staying valid for the rest
+ * of their TTL.
+ */
+export async function revokeUserSessions(userId: string): Promise<number> {
+  const revoked = await db.delete(sessions).where(eq(sessions.userId, userId)).returning({ id: sessions.id });
+  return revoked.length;
+}
+
+/** Housekeeping: drop session rows that are already past their expiry. */
+export async function deleteExpiredSessions(): Promise<void> {
+  try {
+    await db.delete(sessions).where(lt(sessions.expiresAt, new Date()));
+  } catch (err) {
+    console.error("[auth] Could not purge expired sessions:", err);
+  }
+}
+
 export type SessionContext = {
   user: SafeUser;
   sessionId: string;
@@ -129,25 +152,81 @@ export async function getSessionContext(req: NextRequest): Promise<SessionContex
   };
 }
 
+/**
+ * Cheap liveness check for a long-lived connection (the SSE stream). Sessions
+ * are revoked by deleting their row, so this is all that is needed to notice
+ * that a password changed or an account was removed mid-stream.
+ */
+export async function isSessionAlive(sessionId: string): Promise<boolean> {
+  const rows = await db
+    .select({ expiresAt: sessions.expiresAt })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .limit(1);
+
+  const row = rows[0];
+  return !!row && row.expiresAt.getTime() >= Date.now();
+}
+
 export async function requireSession(req: NextRequest): Promise<SessionContext> {
   const ctx = await getSessionContext(req);
   if (!ctx) throw new AuthError(401, "Your session has expired. Please log in again.");
   return ctx;
 }
 
-/** Defense-in-depth CSRF check: double-submit token + same-origin check. */
+/**
+ * Hosts this request could legitimately have been addressed to: the Host
+ * header, whatever a reverse proxy reports in X-Forwarded-Host, and an
+ * explicitly configured PUBLIC_ORIGIN. Comparing against all of them keeps
+ * the check working behind a proxy that rewrites Host (e.g. the sandbox
+ * preview URL) instead of breaking every state-changing request.
+ */
+function candidateRequestHosts(req: NextRequest): string[] {
+  const hosts = new Set<string>();
+
+  const host = req.headers.get("host");
+  if (host) hosts.add(host.trim());
+
+  const forwardedHost = req.headers.get("x-forwarded-host");
+  if (forwardedHost) {
+    for (const entry of forwardedHost.split(",")) {
+      const trimmed = entry.trim();
+      if (trimmed) hosts.add(trimmed);
+    }
+  }
+
+  const configured = process.env.PUBLIC_ORIGIN;
+  if (configured) {
+    try {
+      hosts.add(new URL(configured).host);
+    } catch {
+      console.warn(`[auth] Ignoring invalid PUBLIC_ORIGIN=${configured}`);
+    }
+  }
+
+  return [...hosts];
+}
+
+/**
+ * Defense-in-depth CSRF check: the double-submit token (which a cross-origin
+ * page cannot read, let alone send as a header) plus an Origin/Host check.
+ */
 export function requireCsrf(req: NextRequest, ctx: SessionContext) {
   const origin = req.headers.get("origin");
-  const host = req.headers.get("host");
 
-  if (origin && host) {
+  if (origin && origin !== "null") {
+    let originHost: string;
     try {
-      const originHost = new URL(origin).host;
-      if (originHost !== host) {
-        throw new AuthError(403, "Cross-origin request blocked.");
-      }
+      originHost = new URL(origin).host;
     } catch {
       throw new AuthError(403, "Invalid origin header.");
+    }
+
+    const candidates = candidateRequestHosts(req);
+    // Only enforce when we actually know a host this request was addressed to;
+    // otherwise the token below is still required.
+    if (candidates.length > 0 && !candidates.includes(originHost)) {
+      throw new AuthError(403, "Cross-origin request blocked.");
     }
   }
 
@@ -165,6 +244,19 @@ export function requireOwner(user: SafeUser) {
 
 export function canUserDeleteFiles(user: SafeUser): boolean {
   return user.role === "owner" || user.canDelete;
+}
+
+/**
+ * Who may create/replace a file's shared thumbnail: the member who uploaded
+ * that file, or the workspace owner. Enforced server-side on every write —
+ * the frontend only hides the action.
+ */
+export function canUserManageThumbnail(
+  user: SafeUser,
+  file: { uploaderId: string | null },
+): boolean {
+  if (user.role === "owner") return true;
+  return !!file.uploaderId && file.uploaderId === user.id;
 }
 
 export function authErrorResponse(err: unknown): NextResponse | null {

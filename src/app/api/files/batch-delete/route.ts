@@ -1,16 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import fs from "node:fs/promises";
-import path from "node:path";
 import { inArray } from "drizzle-orm";
 import { db } from "@/db";
 import { files } from "@/db/schema";
 import { canUserDeleteFiles, requireCsrf, requireSession } from "@/lib/auth";
-import { handleApiError, ApiError } from "@/lib/api-helpers";
-import { FILES_DIR, THUMBS_DIR } from "@/lib/config";
+import { ApiError, handleApiError } from "@/lib/api-helpers";
+import { isSafeFileId } from "@/lib/files";
 import { broadcast } from "@/lib/events";
+import { deleteFileRecords } from "@/lib/storage";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+
+const MAX_BATCH = 500;
 
 export async function POST(req: NextRequest) {
   try {
@@ -22,29 +23,30 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json().catch(() => null);
-    const ids: string[] = Array.isArray(body?.ids) ? body.ids.filter((x: unknown) => typeof x === "string") : [];
+    const requested: string[] = Array.isArray(body?.ids)
+      ? body.ids.filter((value: unknown): value is string => typeof value === "string")
+      : [];
 
+    const ids = [...new Set(requested.filter(isSafeFileId))];
     if (ids.length === 0) throw new ApiError(400, "No file ids were provided.");
+    if (ids.length > MAX_BATCH) throw new ApiError(400, `Please delete at most ${MAX_BATCH} files at a time.`);
 
-    const rows = await db.select({ id: files.id }).from(files).where(inArray(files.id, ids));
-    const foundIds = rows.map((r) => r.id);
+    const existing = await db.select({ id: files.id }).from(files).where(inArray(files.id, ids));
+    const foundIds = existing.map((row) => row.id);
 
-    if (foundIds.length > 0) {
-      await db.delete(files).where(inArray(files.id, foundIds));
-
-      await Promise.all(
-        foundIds.map(async (id) => {
-          await fs.rm(path.join(FILES_DIR, id), { recursive: true, force: true });
-          await fs.rm(path.join(THUMBS_DIR, `${id}.jpg`), { force: true });
-        }),
-      );
-
-      broadcast("files-deleted", { ids: foundIds });
+    if (foundIds.length === 0) {
+      return NextResponse.json({ deleted: [], missing: ids, cleanupPending: false });
     }
 
-    return NextResponse.json({ deleted: foundIds, missing: ids.filter((id) => !foundIds.includes(id)) });
+    const result = await deleteFileRecords(foundIds);
+    broadcast("files-deleted", { ids: result.deleted });
+
+    return NextResponse.json({
+      deleted: result.deleted,
+      missing: ids.filter((id) => !result.deleted.includes(id)),
+      cleanupPending: !result.cleanupComplete,
+    });
   } catch (err) {
     return handleApiError(err);
   }
 }
-
