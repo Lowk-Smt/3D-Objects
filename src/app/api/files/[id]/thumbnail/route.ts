@@ -8,6 +8,7 @@ import { MAX_THUMBNAIL_BYTES } from "@/lib/config";
 import { decodeImageDataUrl, isSafeFileId, sniffImageType } from "@/lib/files";
 import { broadcast } from "@/lib/events";
 import { readThumbnail, removeThumbnails, writeThumbnail } from "@/lib/storage";
+import { ServerTiming } from "@/lib/timing";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -20,32 +21,44 @@ async function loadFile(id: string) {
 }
 
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const timing = new ServerTiming();
   try {
     const { id } = await params;
-    await requireSession(req);
+    await timing.timeAsync("auth", () => requireSession(req), "Session authentication");
 
     // A thumbnail is only served for a file that actually exists in the
     // library, and the id is validated before it ever reaches object storage.
-    const row = await loadFile(id);
+    const row = await timing.timeAsync("db", () => loadFile(id), "Database file lookup");
     if (!row.hasThumbnail) throw new ApiError(404, "No thumbnail available.");
 
-    const thumb = await readThumbnail(id, row.thumbExt);
+    const thumb = await timing.timeAsync(
+      "storage_get",
+      () => readThumbnail(id, row.thumbExt),
+      "Read thumbnail from storage",
+    );
     if (!thumb) throw new ApiError(404, "No thumbnail available.");
 
     // Keep the stored extension/mime in sync with the bytes we just read.
     if (thumb.repairedExt && thumb.repairedExt !== row.thumbExt) {
-      await db.update(files).set({ thumbExt: thumb.ext, thumbMime: thumb.mime }).where(eq(files.id, id));
+      await timing.timeAsync(
+        "db_repair",
+        () => db.update(files).set({ thumbExt: thumb.ext, thumbMime: thumb.mime }).where(eq(files.id, id)),
+        "Repair thumbnail metadata",
+      );
     }
 
-    return new NextResponse(new Uint8Array(thumb.buffer), {
-      headers: {
-        // Always the type of the bytes actually being served.
-        "Content-Type": thumb.mime,
-        "Content-Length": String(thumb.buffer.length),
-        "X-Content-Type-Options": "nosniff",
-        "Cache-Control": "private, max-age=31536000, immutable",
-      },
+    const headers = new Headers({
+      // Always the type of the bytes actually being served.
+      "Content-Type": thumb.mime,
+      "Content-Length": String(thumb.buffer.length),
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "private, max-age=31536000, immutable",
     });
+
+    const timingHeader = timing.headerValue();
+    if (timingHeader) headers.set("Server-Timing", timingHeader);
+
+    return new NextResponse(new Uint8Array(thumb.buffer), { headers });
   } catch (err) {
     return handleApiError(err);
   }
@@ -59,12 +72,13 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
 // owner, may create/replace it. The bytes decide their own extension and MIME,
 // so a PNG can never be stored as `<id>.jpg` or served as `image/jpeg`.
 export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  const timing = new ServerTiming();
   try {
     const { id } = await params;
-    const ctx = await requireSession(req);
-    requireCsrf(req, ctx);
+    const ctx = await timing.timeAsync("auth", () => requireSession(req), "Session auth");
+    timing.time("csrf", () => requireCsrf(req, ctx), "CSRF check");
 
-    const row = await loadFile(id);
+    const row = await timing.timeAsync("db", () => loadFile(id), "Database file lookup");
 
     if (!canUserManageThumbnail(ctx.user, row)) {
       throw new ApiError(
@@ -74,7 +88,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
     }
 
     const body = await req.json().catch(() => null);
-    const decoded = decodeImageDataUrl(String(body?.dataUrl || ""));
+    const decoded = timing.time("decode", () => decodeImageDataUrl(String(body?.dataUrl || "")), "Decode data URL");
     if (!decoded) throw new ApiError(400, "Invalid thumbnail image.");
 
     const { buffer, declaredMime } = decoded;
@@ -83,7 +97,7 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       throw new ApiError(413, `Thumbnail is too large (max ${Math.round(MAX_THUMBNAIL_BYTES / 1024 / 1024)}MB).`);
     }
 
-    const type = sniffImageType(buffer);
+    const type = timing.time("sniff", () => sniffImageType(buffer), "Sniff image type");
     if (!type) {
       throw new ApiError(415, "Thumbnails must be JPEG, PNG, WebP or GIF images.");
     }
@@ -93,13 +107,22 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
       );
     }
 
-    await writeThumbnail(id, buffer, type);
+    await timing.timeAsync(
+      "storage_put",
+      () => writeThumbnail(id, buffer, type),
+      "Write thumbnail to storage",
+    );
 
     try {
-      await db
-        .update(files)
-        .set({ hasThumbnail: true, thumbExt: type.ext, thumbMime: type.mime, updatedAt: new Date() })
-        .where(eq(files.id, id));
+      await timing.timeAsync(
+        "db_update",
+        () =>
+          db
+            .update(files)
+            .set({ hasThumbnail: true, thumbExt: type.ext, thumbMime: type.mime, updatedAt: new Date() })
+            .where(eq(files.id, id)),
+        "Update thumbnail metadata in database",
+      );
     } catch (err) {
       // Don't leave an unreferenced thumbnail behind if the metadata write
       // fails — the next preview can simply generate it again.
@@ -110,7 +133,8 @@ export async function PUT(req: NextRequest, { params }: { params: Promise<{ id: 
 
     broadcast("file-updated", { id, hasThumbnail: true, updatedAt: Date.now() });
 
-    return NextResponse.json({ ok: true, ext: type.ext, mime: type.mime });
+    const res = NextResponse.json({ ok: true, ext: type.ext, mime: type.mime });
+    return timing.apply(res);
   } catch (err) {
     return handleApiError(err);
   }

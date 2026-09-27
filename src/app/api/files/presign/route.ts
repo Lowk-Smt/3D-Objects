@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireCsrf, requireSession } from "@/lib/auth";
 import { handleApiError } from "@/lib/api-helpers";
 import { createPresignedUpload } from "@/lib/storage";
+import { ServerTiming } from "@/lib/timing";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -20,22 +21,29 @@ export const runtime = "nodejs";
  * server-side: session, CSRF, size limits, sanitizing, quota and key choice.
  */
 export async function POST(req: NextRequest) {
+  const timing = new ServerTiming();
   try {
-    const ctx = await requireSession(req);
-    requireCsrf(req, ctx);
+    const ctx = await timing.timeAsync("auth", () => requireSession(req), "Session auth");
+    timing.time("csrf", () => requireCsrf(req, ctx), "CSRF check");
 
     const body = await req.json().catch(() => null);
 
-    const presigned = await createPresignedUpload({
-      name: body?.name,
-      path: body?.path,
-      size: body?.size,
-      optimized: body?.optimized,
-      preset: body?.preset,
-      user: ctx.user,
-    });
+    const presigned = await timing.timeAsync(
+      "presign",
+      () =>
+        createPresignedUpload({
+          name: body?.name,
+          path: body?.path,
+          size: body?.size,
+          optimized: body?.optimized,
+          preset: body?.preset,
+          user: ctx.user,
+        }),
+      "Presigned upload reservation",
+    );
 
-    return NextResponse.json(presigned, { status: 201 });
+    const res = NextResponse.json(presigned, { status: 201 });
+    return timing.apply(res);
   } catch (err) {
     return handleApiError(err);
   }

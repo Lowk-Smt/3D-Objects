@@ -17,6 +17,8 @@ import {
   sniffImageType,
 } from "../src/lib/files.ts";
 
+import { ServerTiming } from "../src/lib/timing.ts";
+
 import { MIME_BY_EXT as CLIENT_MIME_BY_EXT } from "../public/vault/shared.js";
 
 test("client and server agree on the MIME table", () => {
@@ -103,3 +105,46 @@ test("decodeImageDataUrl validates the payload shape", () => {
   assert.equal(decodeImageDataUrl("data:image/jpeg;base64,"), null);
   assert.equal(decodeImageDataUrl("data:text/html;base64,PHNjcmlwdD4="), null);
 });
+
+test("ServerTiming measures sync and async executions and formats headers", async () => {
+  const timing = new ServerTiming();
+
+  const syncVal = timing.time("sync_step", () => 42, "Sync operation");
+  assert.equal(syncVal, 42);
+
+  const asyncVal = await timing.timeAsync("async_step", async () => "result", "Async operation");
+  assert.equal(asyncVal, "result");
+
+  timing.record("custom", 12.34, "Custom metric");
+
+  const header = timing.headerValue();
+  assert.ok(header.includes("sync_step;dur="));
+  assert.ok(header.includes('desc="Sync operation"'));
+  assert.ok(header.includes("async_step;dur="));
+  assert.ok(header.includes("custom;dur=12.34"));
+
+  const res = new Response(JSON.stringify({ ok: true }));
+  timing.apply(res);
+  assert.equal(res.headers.get("Server-Timing"), header);
+});
+
+test("ServerTiming records elapsed duration even when an operation throws", async () => {
+  const timing = new ServerTiming();
+
+  assert.throws(() => {
+    timing.time("failing_sync", () => {
+      throw new Error("fail");
+    });
+  }, /fail/);
+
+  await assert.rejects(async () => {
+    await timing.timeAsync("failing_async", async () => {
+      throw new Error("async fail");
+    });
+  }, /async fail/);
+
+  const header = timing.headerValue();
+  assert.ok(header.includes("failing_sync;dur="));
+  assert.ok(header.includes("failing_async;dur="));
+});
+
