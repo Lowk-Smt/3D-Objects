@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { ApiError } from "@/lib/api-helpers";
 import { isSafeFileId, sanitizeStoredName } from "@/lib/files";
 import { R2Error, fileObjectKey, getObjectStore } from "@/lib/r2";
+import { ServerTiming } from "@/lib/timing";
 
 /** Encode a filename for use in Content-Disposition, RFC 5987 safe. */
 function contentDispositionValue(disposition: "inline" | "attachment", filename: string): string {
@@ -18,7 +19,10 @@ export async function streamFileResponse(opts: {
   mime: string;
   displayName: string;
   disposition: "inline" | "attachment";
+  serverTiming?: ServerTiming;
 }): Promise<NextResponse> {
+  const timing = opts.serverTiming || new ServerTiming();
+
   if (!isSafeFileId(opts.id)) throw new ApiError(400, "Invalid file id.");
 
   // storedName is sanitized on write and again here. The key builder rejects
@@ -28,7 +32,11 @@ export async function streamFileResponse(opts: {
 
   let object;
   try {
-    object = await getObjectStore().getStream(key);
+    object = await timing.timeAsync(
+      "storage_get",
+      () => getObjectStore().getStream(key),
+      "Object storage getStream",
+    );
   } catch (err) {
     if (err instanceof R2Error && err.status === 503) {
       throw new ApiError(503, err.message);
@@ -41,17 +49,22 @@ export async function streamFileResponse(opts: {
     throw new ApiError(404, "This file's data is missing from storage on the server.");
   }
 
-  return new NextResponse(object.stream, {
-    headers: {
-      "Content-Type": opts.mime || "application/octet-stream",
-      "Content-Length": String(object.size),
-      "Content-Disposition": contentDispositionValue(opts.disposition, opts.displayName),
-      // Uploaded files are user-supplied content: never let a browser sniff it
-      // into something executable, and neutralize any active content (e.g. an
-      // SVG with a script) if one is opened directly.
-      "X-Content-Type-Options": "nosniff",
-      "Content-Security-Policy": "default-src 'none'; sandbox",
-      "Cache-Control": "private, max-age=0, no-cache",
-    },
+  const headers = new Headers({
+    "Content-Type": opts.mime || "application/octet-stream",
+    "Content-Length": String(object.size),
+    "Content-Disposition": contentDispositionValue(opts.disposition, opts.displayName),
+    // Uploaded files are user-supplied content: never let a browser sniff it
+    // into something executable, and neutralize any active content (e.g. an
+    // SVG with a script) if one is opened directly.
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; sandbox",
+    "Cache-Control": "private, max-age=0, no-cache",
   });
+
+  const timingHeader = timing.headerValue();
+  if (timingHeader) {
+    headers.set("Server-Timing", timingHeader);
+  }
+
+  return new NextResponse(object.stream, { headers });
 }

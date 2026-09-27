@@ -70,6 +70,47 @@ function retypeBlob(blob, name){
 }
 
 /* ============================================================
+   PERFORMANCE INSTRUMENTATION
+   ============================================================ */
+
+let perfSeq = 0;
+const perf = {
+  time(label){
+    const seq = ++perfSeq;
+    const startMark = `vault:${label}:${seq}:start`;
+    const endMark = `vault:${label}:${seq}:end`;
+    const measureName = `vault:${label}`;
+    const start = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    try {
+      if (typeof performance !== 'undefined' && performance.mark){
+        performance.mark(startMark);
+      }
+    } catch { /* never throw */ }
+
+    let ended = false;
+    return {
+      end(extra){
+        if (ended) return 0;
+        ended = true;
+        const end = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        const duration = Math.round((end - start) * 10) / 10;
+        try {
+          if (typeof performance !== 'undefined' && performance.mark){
+            performance.mark(endMark);
+            if (performance.measure){
+              performance.measure(measureName, startMark, endMark);
+            }
+          }
+        } catch { /* never throw */ }
+        const extraStr = extra ? ` (${extra})` : '';
+        console.debug(`[perf] ${label}: ${duration}ms${extraStr}`);
+        return duration;
+      }
+    };
+  }
+};
+
+/* ============================================================
    BACKEND API CLIENT
    ============================================================ */
 
@@ -133,6 +174,11 @@ async function apiFetch(url, options = {}){
   }
 
   if (response.status === 204) return null;
+
+  const serverTiming = response.headers.get('server-timing');
+  if (serverTiming){
+    console.debug(`[perf:server] ${method} ${url}: ${serverTiming}`);
+  }
 
   const ct = response.headers.get('content-type') || '';
   if (ct.includes('application/json')) return response.json();
@@ -223,19 +269,47 @@ function uploadWithProgress(file, relPath, extra, onProgress){
   });
 
   return (async () => {
-    const presigned = await apiFetch('/api/files/presign', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(presignBody),
-    });
-    await putToStorage(presigned.uploadUrl, presigned.contentType);
-    if (onProgress) onProgress(1);
-    const completed = await apiFetch('/api/files/complete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: presigned.id }),
-    });
-    return completed.file;
+    const totalUploadTimer = perf.time(`upload:${file.name}`);
+    try {
+      const presignTimer = perf.time('upload:presign');
+      let presigned;
+      try {
+        presigned = await apiFetch('/api/files/presign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(presignBody),
+        });
+      } finally {
+        presignTimer.end();
+      }
+
+      const putTimer = perf.time('upload:put');
+      try {
+        await putToStorage(presigned.uploadUrl, presigned.contentType);
+      } finally {
+        putTimer.end(`${file.size}B`);
+      }
+
+      if (onProgress) onProgress(1);
+
+      const completeTimer = perf.time('upload:complete');
+      let completed;
+      try {
+        completed = await apiFetch('/api/files/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: presigned.id }),
+        });
+      } finally {
+        completeTimer.end();
+      }
+
+      totalUploadTimer.end(`${file.size}B`);
+      return completed.file;
+    } catch (err){
+      totalUploadTimer.end('failed');
+      throw err;
+    }
   })();
 }
 
@@ -287,68 +361,108 @@ async function resizeTextureManually(texture, maxSize){
 }
 
 async function optimizeGLBBlob(blob, onProgress, presetKey = 'balanced', cancelToken = null){
+  const totalTimer = perf.time(`optimize:${presetKey}`);
   const preset = OPTIMIZE_PRESETS[presetKey] || OPTIMIZE_PRESETS.balanced;
   const report = (step, pct) => { if (onProgress) onProgress(step, pct); };
   const checkCancelled = () => { if (cancelToken && cancelToken.cancelled) throw new Error('OPTIMIZE_CANCELLED'); };
 
-  report('Reading file…', 5);
-  checkCancelled();
-
-  const io = new WebIO();
-  const buffer = await blob.arrayBuffer();
-  const document = await io.readBinary(new Uint8Array(buffer));
-
-  report('Simplifying mesh…', 20);
-  await document.transform(simplify({ simplifier: MeshoptSimplifier, ratio: preset.ratio, error: preset.error }));
-  checkCancelled();
-
-  report('Resizing textures…', 50);
-  const textures = document.getRoot().listTextures();
-  for (let i = 0; i < textures.length; i++){
-    try { await resizeTextureManually(textures[i], preset.textureSize); }
-    catch (err){ console.warn('Texture resize skipped for one texture:', err); }
-    report('Resizing textures…', Math.min(50 + Math.round(((i + 1) / textures.length) * 25), 75));
+  try {
+    report('Reading file…', 5);
     checkCancelled();
+
+    const readTimer = perf.time('optimize:read');
+    let document;
+    const io = new WebIO();
+    try {
+      const buffer = await blob.arrayBuffer();
+      document = await io.readBinary(new Uint8Array(buffer));
+    } finally {
+      readTimer.end();
+    }
+
+    report('Simplifying mesh…', 20);
+    const simplifyTimer = perf.time('optimize:simplify');
+    try {
+      await document.transform(simplify({ simplifier: MeshoptSimplifier, ratio: preset.ratio, error: preset.error }));
+    } finally {
+      simplifyTimer.end();
+    }
+    checkCancelled();
+
+    report('Resizing textures…', 50);
+    const texturesTimer = perf.time('optimize:textures');
+    try {
+      const textures = document.getRoot().listTextures();
+      for (let i = 0; i < textures.length; i++){
+        try { await resizeTextureManually(textures[i], preset.textureSize); }
+        catch (err){ console.warn('Texture resize skipped for one texture:', err); }
+        report('Resizing textures…', Math.min(50 + Math.round(((i + 1) / textures.length) * 25), 75));
+        checkCancelled();
+      }
+    } finally {
+      texturesTimer.end();
+    }
+
+    report('Cleaning unused data…', 85);
+    const cleanTimer = perf.time('optimize:clean');
+    try {
+      await document.transform(prune());
+      await document.transform(dedup());
+    } finally {
+      cleanTimer.end();
+    }
+    checkCancelled();
+
+    // Remove tool/export metadata WITHOUT touching meaningful names.
+    //
+    // Verified behaviour (asserted by tests/optimizer.test.mjs, documented in
+    // the README's "Optimization" section):
+    //  - the glTF writer always emits an `asset.generator`, and glTF-Transform's
+    //    reader never carries the *original* exporter string into the document,
+    //    so the uploaded file is deliberately re-tagged as Model Vault's output;
+    //  - `asset.extras` (and every node/mesh/material/texture/scene `extras`
+    //    block) is dropped from the written file, so tool-specific metadata does
+    //    not travel with the shared model;
+    //  - existing names are kept byte-for-byte. Only properties that were saved
+    //    without any name get a neutral placeholder, so they stay identifiable.
+    report('Removing tool metadata…', 92);
+    const metaTimer = perf.time('optimize:metadata');
+    try {
+      const asset = document.getRoot().getAsset();
+      if (asset){
+        asset.generator = GENERATOR_TAG;
+        delete asset.extras;
+      }
+      document.getRoot().setExtras({});
+
+      const fallbackName = (prefix, i, existing) => (existing && existing.trim() ? existing : `${prefix}_${i}`);
+      document.getRoot().listNodes().forEach((n, i) => { n.setName(fallbackName('node', i, n.getName())); n.setExtras({}); });
+      document.getRoot().listMeshes().forEach((n, i) => { n.setName(fallbackName('mesh', i, n.getName())); n.setExtras({}); });
+      document.getRoot().listMaterials().forEach((n, i) => { n.setName(fallbackName('material', i, n.getName())); n.setExtras({}); });
+      document.getRoot().listTextures().forEach((n, i) => { n.setName(fallbackName('texture', i, n.getName())); n.setExtras({}); });
+      document.getRoot().listScenes().forEach((n, i) => { n.setName(fallbackName('scene', i, n.getName())); n.setExtras({}); });
+    } finally {
+      metaTimer.end();
+    }
+    checkCancelled();
+
+    report('Writing file…', 98);
+    const writeTimer = perf.time('optimize:write');
+    let result;
+    try {
+      result = await io.writeBinary(document);
+    } finally {
+      writeTimer.end();
+    }
+    report('Done!', 100);
+
+    const outBlob = new Blob([result], { type: 'model/gltf-binary' });
+    totalTimer.end(`${fmtSize(blob.size)} → ${fmtSize(outBlob.size)}`);
+    return outBlob;
+  } catch (err){
+    totalTimer.end('cancelled or failed');
+    throw err;
   }
-
-  report('Cleaning unused data…', 85);
-  await document.transform(prune());
-  await document.transform(dedup());
-  checkCancelled();
-
-  // Remove tool/export metadata WITHOUT touching meaningful names.
-  //
-  // Verified behaviour (asserted by tests/optimizer.test.mjs, documented in
-  // the README's "Optimization" section):
-  //  - the glTF writer always emits an `asset.generator`, and glTF-Transform's
-  //    reader never carries the *original* exporter string into the document,
-  //    so the uploaded file is deliberately re-tagged as Model Vault's output;
-  //  - `asset.extras` (and every node/mesh/material/texture/scene `extras`
-  //    block) is dropped from the written file, so tool-specific metadata does
-  //    not travel with the shared model;
-  //  - existing names are kept byte-for-byte. Only properties that were saved
-  //    without any name get a neutral placeholder, so they stay identifiable.
-  report('Removing tool metadata…', 92);
-  const asset = document.getRoot().getAsset();
-  if (asset){
-    asset.generator = GENERATOR_TAG;
-    delete asset.extras;
-  }
-  document.getRoot().setExtras({});
-
-  const fallbackName = (prefix, i, existing) => (existing && existing.trim() ? existing : `${prefix}_${i}`);
-  document.getRoot().listNodes().forEach((n, i) => { n.setName(fallbackName('node', i, n.getName())); n.setExtras({}); });
-  document.getRoot().listMeshes().forEach((n, i) => { n.setName(fallbackName('mesh', i, n.getName())); n.setExtras({}); });
-  document.getRoot().listMaterials().forEach((n, i) => { n.setName(fallbackName('material', i, n.getName())); n.setExtras({}); });
-  document.getRoot().listTextures().forEach((n, i) => { n.setName(fallbackName('texture', i, n.getName())); n.setExtras({}); });
-  document.getRoot().listScenes().forEach((n, i) => { n.setName(fallbackName('scene', i, n.getName())); n.setExtras({}); });
-  checkCancelled();
-
-  report('Writing file…', 98);
-  const result = await io.writeBinary(document);
-  report('Done!', 100);
-
-  return new Blob([result], { type: 'model/gltf-binary' });
 }
 
 function askToOptimize(file){
@@ -645,6 +759,7 @@ async function createDependencyUrl(modelMeta, uri, cache, createdUrls){
 }
 
 async function parseGLTF(rawBlob, name, meta){
+  const gltfTimer = perf.time(`parse:gltf:${name}`);
   const jsonText = await rawBlob.text();
   let json;
   try { json = JSON.parse(jsonText); } catch { throw new Error(`"${name}" is not valid glTF JSON.`); }
@@ -673,54 +788,76 @@ async function parseGLTF(rawBlob, name, meta){
     loader.setKTX2Loader(ktx2Loader);
     loader.setMeshoptDecoder(MeshoptDecoder);
 
-    return await loader.parseAsync(JSON.stringify(json), '');
+    const result = await loader.parseAsync(JSON.stringify(json), '');
+    gltfTimer.end('ok');
+    return result;
+  } catch (err){
+    gltfTimer.end('failed');
+    throw err;
   } finally {
     for (const objectUrl of createdUrls) URL.revokeObjectURL(objectUrl);
   }
 }
 
 async function parseModel(rawBlob, name, meta){
+  const parseTimer = perf.time(`parse:${getExt(name) || 'unknown'}`);
   const blob = retypeBlob(rawBlob, name);
   const ext = getExt(name);
 
-  switch (ext){
-    case 'glb': {
-      const buffer = await blob.arrayBuffer();
-      const loader = new GLTFLoader();
-      loader.setDRACOLoader(dracoLoader);
-      loader.setKTX2Loader(ktx2Loader);
-      loader.setMeshoptDecoder(MeshoptDecoder);
-      const result = await loader.parseAsync(buffer, '');
-      return { object: result.scene, animations: result.animations || [] };
+  try {
+    switch (ext){
+      case 'glb': {
+        const abTimer = perf.time('parse:glb:arrayBuffer');
+        let buffer;
+        try {
+          buffer = await blob.arrayBuffer();
+        } finally {
+          abTimer.end(`${buffer ? buffer.byteLength : 0}B`);
+        }
+        const loader = new GLTFLoader();
+        loader.setDRACOLoader(dracoLoader);
+        loader.setKTX2Loader(ktx2Loader);
+        loader.setMeshoptDecoder(MeshoptDecoder);
+        const glbLoadTimer = perf.time('parse:glb:loader');
+        let result;
+        try {
+          result = await loader.parseAsync(buffer, '');
+        } finally {
+          glbLoadTimer.end();
+        }
+        return { object: result.scene, animations: result.animations || [] };
+      }
+      case 'gltf': {
+        const result = await parseGLTF(blob, name, meta);
+        return { object: result.scene, animations: result.animations || [] };
+      }
+      case 'obj': {
+        const text = await blob.text();
+        return { object: new OBJLoader().parse(text) };
+      }
+      case 'stl': {
+        const buffer = await blob.arrayBuffer();
+        const geometry = new STLLoader().parse(buffer);
+        geometry.computeVertexNormals();
+        return { object: new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x9aa7b8, metalness: 0.15, roughness: 0.6 })) };
+      }
+      case 'ply': {
+        const buffer = await blob.arrayBuffer();
+        const geometry = new PLYLoader().parse(buffer);
+        if (geometry.hasAttribute && geometry.hasAttribute('position')) geometry.computeVertexNormals();
+        const hasColor = !!geometry.getAttribute('color');
+        return { object: new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ vertexColors: hasColor, color: hasColor ? 0xffffff : 0x9aa7b8, metalness: 0.1, roughness: 0.7 })) };
+      }
+      case 'fbx': {
+        const buffer = await blob.arrayBuffer();
+        const object = new FBXLoader().parse(buffer, '');
+        return { object, animations: object.animations || [] };
+      }
+      default:
+        return null;
     }
-    case 'gltf': {
-      const result = await parseGLTF(blob, name, meta);
-      return { object: result.scene, animations: result.animations || [] };
-    }
-    case 'obj': {
-      const text = await blob.text();
-      return { object: new OBJLoader().parse(text) };
-    }
-    case 'stl': {
-      const buffer = await blob.arrayBuffer();
-      const geometry = new STLLoader().parse(buffer);
-      geometry.computeVertexNormals();
-      return { object: new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 0x9aa7b8, metalness: 0.15, roughness: 0.6 })) };
-    }
-    case 'ply': {
-      const buffer = await blob.arrayBuffer();
-      const geometry = new PLYLoader().parse(buffer);
-      if (geometry.hasAttribute && geometry.hasAttribute('position')) geometry.computeVertexNormals();
-      const hasColor = !!geometry.getAttribute('color');
-      return { object: new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ vertexColors: hasColor, color: hasColor ? 0xffffff : 0x9aa7b8, metalness: 0.1, roughness: 0.7 })) };
-    }
-    case 'fbx': {
-      const buffer = await blob.arrayBuffer();
-      const object = new FBXLoader().parse(buffer, '');
-      return { object, animations: object.animations || [] };
-    }
-    default:
-      return null;
+  } finally {
+    parseTimer.end(ext);
   }
 }
 
@@ -891,27 +1028,41 @@ async function openModel(meta){
   fbCard.classList.add('hidden');
   setStatus('Loading ' + meta.name + '…');
 
+  const openTimer = perf.time(`preview:open:${meta.name}`);
   let blob;
+  const fetchTimer = perf.time(`preview:fetch:${meta.name}`);
   try {
     blob = await api.fetchRaw(meta.id);
   } catch (error){
+    fetchTimer.end('failed');
+    openTimer.end('fetch failed');
     if (token !== previewToken) return;
     showFallback(meta, error.message || 'Could not download this file from the server.');
     setStatus('');
     return;
   }
+  fetchTimer.end(`${blob.size}B`);
 
-  if (token !== previewToken) return;
+  if (token !== previewToken){
+    openTimer.end('superseded');
+    return;
+  }
 
   let result = null; let error = null;
+  const parseTimer = perf.time(`preview:parse:${meta.name}`);
   try {
     result = await parseModel(blob, meta.name, meta);
   } catch (err){
     error = err;
     console.error('Preview failed:', meta.name, err);
+  } finally {
+    parseTimer.end(error ? 'failed' : 'ok');
   }
 
-  if (token !== previewToken) return;
+  if (token !== previewToken){
+    openTimer.end('superseded');
+    return;
+  }
 
   if (error || !result){
     clearModel();
@@ -919,12 +1070,20 @@ async function openModel(meta){
     renderList();
     showFallback(meta, error ? error.message : `.${getExt(meta.name)} files can't be previewed here, but they're stored safely and can be downloaded.`);
     setStatus('');
+    openTimer.end('unsupported or error');
     return;
   }
 
   clearModel();
   const object = result.object;
-  normalize(object);
+
+  const normTimer = perf.time('preview:normalize');
+  try {
+    normalize(object);
+  } finally {
+    normTimer.end();
+  }
+
   scene.add(object);
   current = object;
 
@@ -933,24 +1092,47 @@ async function openModel(meta){
     for (const clip of result.animations) mixer.clipAction(clip).play();
   }
 
-  frameCamera(object);
+  const frameTimer = perf.time('preview:frameCamera');
+  try {
+    frameCamera(object);
+  } finally {
+    frameTimer.end();
+  }
+
   state.activeId = meta.id;
   renderList();
   setStatus('');
   needsRender = true;
+  openTimer.end('ready');
 
   // Thumbnails are shared with the whole workspace, so only the uploader (or
   // the owner) may create/replace one — the API enforces the same rule.
   if (!meta.thumb && canManageThumbnail(meta)){
     requestAnimationFrame(async () => {
       if (token !== previewToken) return;
+      const thumbTotalTimer = perf.time(`thumbnail:generateAndSave:${meta.name}`);
       try {
-        const thumb = captureThumb(200);
-        await api.saveThumbnail(meta.id, thumb);
+        const captureTimer = perf.time('thumbnail:capture');
+        let thumb;
+        try {
+          thumb = captureThumb(200);
+        } finally {
+          captureTimer.end();
+        }
+
+        const saveTimer = perf.time('thumbnail:save');
+        try {
+          await api.saveThumbnail(meta.id, thumb);
+        } finally {
+          saveTimer.end();
+        }
+
         meta.thumb = thumb;
         meta.updatedAt = Date.now();
         renderThumbBadge(meta.id, thumb);
+        thumbTotalTimer.end('saved');
       } catch (error){
+        thumbTotalTimer.end('failed');
         console.warn('Thumbnail upload failed:', error);
         if (error && error.status !== 401){
           flash('Preview thumbnail was not saved: ' + (error.message || 'unknown error'));
