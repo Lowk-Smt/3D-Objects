@@ -6,7 +6,11 @@ import assert from "node:assert/strict";
 // exercised under Node: in-flight de-duplication, reference-counted abort,
 // rapid switching, stale-preview protection hooks, cache hits and eviction,
 // and the upload -> preview handoff (seed).
-import { createPreviewDownloader } from "../public/vault/preview-cache.js";
+import {
+  DEFAULT_MAX_CACHE_BYTES,
+  DEFAULT_MAX_CACHE_ENTRIES,
+  createPreviewDownloader,
+} from "../public/vault/preview-cache.js";
 
 /** Minimal Blob stand-in with a `size` (Node's global Blob works too). */
 function fakeBlob(bytes) {
@@ -368,4 +372,12 @@ test("load() without meta.id rejects instead of throwing synchronously", async (
 
 test("createPreviewDownloader requires a fetch implementation", () => {
   assert.throws(() => createPreviewDownloader({}), TypeError);
+});
+
+test("production defaults: the browser preview cache cap is 100 MB", () => {
+  // The browser (app.js) constructs its loader with these defaults, so this
+  // pins the conservative production target: a drifted cap would change the
+  // tab's memory behaviour silently.
+  assert.equal(DEFAULT_MAX_CACHE_BYTES, 100 * 1024 * 1024);
+  assert.equal(DEFAULT_MAX_CACHE_ENTRIES, 8);
 });

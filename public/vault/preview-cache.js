@@ -34,7 +34,10 @@
    ============================================================ */
 
 export const DEFAULT_MAX_CACHE_ENTRIES = 8;
-export const DEFAULT_MAX_CACHE_BYTES = 256 * 1024 * 1024; // per browser tab
+// Conservative production target for a browser tab: enough to keep the
+// models a workspace actually flips between resident, small enough that the
+// cache can never become the page's memory problem. (Per browser tab.)
+export const DEFAULT_MAX_CACHE_BYTES = 100 * 1024 * 1024;
 
 export function createPreviewDownloader({
   fetch,
