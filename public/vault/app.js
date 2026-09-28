@@ -34,10 +34,13 @@ import {
   DEFAULT_THRESHOLD_ANGLE, WORKER_FILE_URL, buildWorkerPayload
 } from './wireframe.js';
 
-/* ---- optimization pipeline imports ---- */
-import { WebIO } from '@gltf-transform/core';
-import { simplify, prune, dedup } from '@gltf-transform/functions';
-import { MeshoptSimplifier } from 'meshoptimizer';
+/* ---- optimization pipeline: the validated, adaptive core is shared verbatim
+       with tests/optimizer.test.mjs and scripts/benchmark-optimizer.mjs; the
+       browser-only halves (canvas texture path, Blob I/O) live beside it ---- */
+import {
+  CANCEL_MESSAGE, optimizeGlbBytes, resolvePreset, shouldUseOptimized,
+} from './optimizer-core.mjs';
+import { createCanvasTextureStrategy } from './optimizer-browser-textures.mjs';
 
 /* ============================================================
    Model Vault — shared multi-user library frontend.
@@ -589,149 +592,43 @@ if (typeof window !== 'undefined'){
 }
 
 /* ============================================================
-   OPTIMIZATION PIPELINE (client-side, WASM-based) — unchanged behavior,
-   except metadata cleanup no longer overwrites meaningful node / mesh /
-   material / texture names. It only fills in a name when one is missing,
-   and strips non-essential generator/tool metadata instead.
+   OPTIMIZATION PIPELINE (client-side, WASM-based) — thin browser wrapper
+   around the shared core in optimizer-core.mjs, which runs the exact same
+   code the unit tests and the real-crate benchmark run:
+
+     validate GLB → read → prune → dedup → simplify → textures → dedup
+                  → prune → metadata → write
+
+   Stages are adaptive (no meshes → no simplify, no textures → no texture
+   pass) and textures take the dual-path treatment: this file supplies the
+   browser half (canvas decode, per-texture alpha scan, WebP/JPEG/PNG
+   encoder choice — optimizer-browser-textures.mjs); the headless half is
+   the dependency-free pure-JS PNG path used by the benchmark.
    ============================================================ */
 
-// Stamped into the optimized file's asset.generator so a shared model always
-// says where it came from, instead of advertising whatever exporter (or AI
-// tool) produced the upload.
-const GENERATOR_TAG = 'Model Vault 1.0 (glTF-Transform)';
-
-const OPTIMIZE_PRESETS = {
-  high:     { ratio: 0.7,  error: 0.0005, textureSize: 2048 },
-  balanced: { ratio: 0.5,  error: 0.0005, textureSize: 2048 },
-  small:    { ratio: 0.25, error: 0.001,  textureSize: 1024 }
-};
-
-async function resizeTextureManually(texture, maxSize){
-  const mimeType = texture.getMimeType() || 'image/jpeg';
-  const imageData = texture.getImage();
-  if (!imageData) return;
-
-  const blob = new Blob([imageData], { type: mimeType });
-  const bitmap = await createImageBitmap(blob);
-
-  if (bitmap.width <= maxSize && bitmap.height <= maxSize){ bitmap.close(); return; }
-
-  const scale = maxSize / Math.max(bitmap.width, bitmap.height);
-  const w = Math.round(bitmap.width * scale);
-  const h = Math.round(bitmap.height * scale);
-
-  const canvas = document.createElement('canvas');
-  canvas.width = w; canvas.height = h;
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(bitmap, 0, 0, w, h);
-  bitmap.close();
-
-  const outputType = mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
-  const quality = outputType === 'image/jpeg' ? 0.9 : undefined;
-  const outBlob = await new Promise(resolve => canvas.toBlob(resolve, outputType, quality));
-  const buffer = new Uint8Array(await outBlob.arrayBuffer());
-
-  texture.setImage(buffer);
-  texture.setMimeType(outputType);
-}
+// One strategy per page: it probes WebP support lazily, once.
+const canvasTextureStrategy = createCanvasTextureStrategy();
 
 async function optimizeGLBBlob(blob, onProgress, presetKey = 'balanced', cancelToken = null){
-  const totalTimer = perf.time(`optimize:${presetKey}`);
-  const preset = OPTIMIZE_PRESETS[presetKey] || OPTIMIZE_PRESETS.balanced;
-  const report = (step, pct) => { if (onProgress) onProgress(step, pct); };
-  const checkCancelled = () => { if (cancelToken && cancelToken.cancelled) throw new Error('OPTIMIZE_CANCELLED'); };
-
+  const totalTimer = perf.time(`optimize:${resolvePreset(presetKey).key}`);
   try {
-    report('Reading file…', 5);
-    checkCancelled();
+    const bytes = new Uint8Array(await blob.arrayBuffer());
 
-    const readTimer = perf.time('optimize:read');
-    let document;
-    const io = new WebIO();
-    try {
-      const buffer = await blob.arrayBuffer();
-      document = await io.readBinary(new Uint8Array(buffer));
-    } finally {
-      readTimer.end();
-    }
+    // The core validates the GLB container before parsing, so a foreign or
+    // corrupt file fails here with an actionable message instead of a
+    // cryptic parser error halfway through the pipeline.
+    const { glb } = await optimizeGlbBytes(bytes, {
+      preset: presetKey,
+      resizeTexture: (texture, limits) => canvasTextureStrategy.resize(texture, limits),
+      timeStage: (label, run) => {
+        const stageTimer = perf.time(`optimize:${label}`);
+        return run().finally(() => stageTimer.end());
+      },
+      onProgress,
+      shouldCancel: () => Boolean(cancelToken && cancelToken.cancelled),
+    });
 
-    report('Simplifying mesh…', 20);
-    const simplifyTimer = perf.time('optimize:simplify');
-    try {
-      await document.transform(simplify({ simplifier: MeshoptSimplifier, ratio: preset.ratio, error: preset.error }));
-    } finally {
-      simplifyTimer.end();
-    }
-    checkCancelled();
-
-    report('Resizing textures…', 50);
-    const texturesTimer = perf.time('optimize:textures');
-    try {
-      const textures = document.getRoot().listTextures();
-      for (let i = 0; i < textures.length; i++){
-        try { await resizeTextureManually(textures[i], preset.textureSize); }
-        catch (err){ console.warn('Texture resize skipped for one texture:', err); }
-        report('Resizing textures…', Math.min(50 + Math.round(((i + 1) / textures.length) * 25), 75));
-        checkCancelled();
-      }
-    } finally {
-      texturesTimer.end();
-    }
-
-    report('Cleaning unused data…', 85);
-    const cleanTimer = perf.time('optimize:clean');
-    try {
-      await document.transform(prune());
-      await document.transform(dedup());
-    } finally {
-      cleanTimer.end();
-    }
-    checkCancelled();
-
-    // Remove tool/export metadata WITHOUT touching meaningful names.
-    //
-    // Verified behaviour (asserted by tests/optimizer.test.mjs, documented in
-    // the README's "Optimization" section):
-    //  - the glTF writer always emits an `asset.generator`, and glTF-Transform's
-    //    reader never carries the *original* exporter string into the document,
-    //    so the uploaded file is deliberately re-tagged as Model Vault's output;
-    //  - `asset.extras` (and every node/mesh/material/texture/scene `extras`
-    //    block) is dropped from the written file, so tool-specific metadata does
-    //    not travel with the shared model;
-    //  - existing names are kept byte-for-byte. Only properties that were saved
-    //    without any name get a neutral placeholder, so they stay identifiable.
-    report('Removing tool metadata…', 92);
-    const metaTimer = perf.time('optimize:metadata');
-    try {
-      const asset = document.getRoot().getAsset();
-      if (asset){
-        asset.generator = GENERATOR_TAG;
-        delete asset.extras;
-      }
-      document.getRoot().setExtras({});
-
-      const fallbackName = (prefix, i, existing) => (existing && existing.trim() ? existing : `${prefix}_${i}`);
-      document.getRoot().listNodes().forEach((n, i) => { n.setName(fallbackName('node', i, n.getName())); n.setExtras({}); });
-      document.getRoot().listMeshes().forEach((n, i) => { n.setName(fallbackName('mesh', i, n.getName())); n.setExtras({}); });
-      document.getRoot().listMaterials().forEach((n, i) => { n.setName(fallbackName('material', i, n.getName())); n.setExtras({}); });
-      document.getRoot().listTextures().forEach((n, i) => { n.setName(fallbackName('texture', i, n.getName())); n.setExtras({}); });
-      document.getRoot().listScenes().forEach((n, i) => { n.setName(fallbackName('scene', i, n.getName())); n.setExtras({}); });
-    } finally {
-      metaTimer.end();
-    }
-    checkCancelled();
-
-    report('Writing file…', 98);
-    const writeTimer = perf.time('optimize:write');
-    let result;
-    try {
-      result = await io.writeBinary(document);
-    } finally {
-      writeTimer.end();
-    }
-    report('Done!', 100);
-
-    const outBlob = new Blob([result], { type: 'model/gltf-binary' });
+    const outBlob = new Blob([glb], { type: 'model/gltf-binary' });
     totalTimer.end(`${fmtSize(blob.size)} → ${fmtSize(outBlob.size)}`);
     return outBlob;
   } catch (err){
@@ -795,7 +692,7 @@ function askToOptimize(file){
 
         // Never make a file bigger by "optimizing" it — the original is the
         // safe fallback, and the user is told why.
-        if (optimizedBlob.size >= file.size){
+        if (!shouldUseOptimized(file.size, optimizedBlob.size)){
           cleanup();
           flash(
             `Optimizing "${file.name}" would have made it larger ` +
@@ -811,7 +708,7 @@ function askToOptimize(file){
         cleanup();
         resolve({ file: optimizedFile, optimized: true, preset: presetKey });
       } catch (err){
-        if (err && err.message === 'OPTIMIZE_CANCELLED'){ cleanup(); resolve({ file: null, optimized: false, preset: null }); return; }
+        if (err && err.message === CANCEL_MESSAGE){ cleanup(); resolve({ file: null, optimized: false, preset: null }); return; }
         console.error('Optimization failed:', err);
         cleanup();
         alert(`Optimization failed for "${file.name}":\n${err.message}\n\nThe original file will be uploaded instead.`);

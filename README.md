@@ -321,11 +321,20 @@ src/
 public/vault/
   styles.css                # the original dark "Model Vault" visual design
   shared.js                 # pure helpers shared by the browser app and the tests
-  app.js                    # frontend: auth UI, viewer, optimizer, live sync
+  app.js                    # frontend: auth UI, viewer, live sync, optimizer wiring
+  optimizer-core.mjs        # validated adaptive optimizer core (browser + Node + tests)
+  optimizer-browser-textures.mjs  # canvas texture path (alpha scan, WebP/JPEG/PNG)
 scripts/
   e2e-test.mjs              # end-to-end acceptance test (two phases)
+  build-crate-fixture.mjs   # generates the deterministic benchmark crate (fixtures/)
+  benchmark-optimizer.mjs   # runs the shipping core over the crate, per preset
+  lib/png-codec.mjs         # dependency-free PNG decode/encode + bilinear downscale
+  lib/headless-textures.mjs # Node texture strategy used by tests + benchmark
+  lib/crate-fixture.mjs     # the crate generator itself
 tests/
   paths.test.mjs            # glTF path/MIME/download-name resolution
+  optimizer.test.mjs        # shipping optimizer core: validation, stages, roles, paths
+  optimizer-browser-textures.test.mjs  # real-canvas encoder checks (no lossy data)
   server-helpers.test.mjs   # server-side sanitizers, sniffers, wire format
   r2-storage.test.mjs       # R2 keys, validation, permissions, quota, rollback, errors
 ```
@@ -464,12 +473,72 @@ reload or a server restart — sees it.
 ## Optimization
 
 Optimizing is optional and always runs **in your browser** before upload
-(`Optimize this file?` → High / Balanced / Smallest). The exact same
-`@gltf-transform` pipeline is used as in the original app: simplify → texture
-resize → prune → dedup, with a progress bar and a cancel button.
+(`Optimize this file?` → High / Balanced / Smallest). The pipeline itself
+lives in `public/vault/optimizer-core.mjs` — a pure, environment-agnostic
+module that the browser UI, the unit tests and the headless benchmark all
+run *verbatim*, so what CI verifies is what ships:
+
+```
+validate GLB → read → prune → dedup → simplify → textures → dedup → prune
+             → metadata → write
+```
+
+- **Validated first.** The GLB container (magic, version, declared length,
+  chunk bounds, JSON chunk, `asset.version`) is checked *before* parsing, so a
+  foreign or corrupt file fails fast with an actionable message
+  (`GlbValidationError` carries a stable `code`) instead of a cryptic parser
+  error halfway through.
+- **Performance reorder.** The cheap structural passes run first, so simplify
+  and texture work operate on data that survived pruning; textures are
+  followed by a second `dedup()`, because two textures that differed before
+  can be byte-identical after the same downscale + re-encode.
+- **Adaptive stages.** Each stage is skipped when the document has no work
+  for it: no mesh primitives → no simplify (MeshoptSimplifier has nothing to
+  do and would throw on an empty document), no textures → no texture pass.
+- **Dual-path textures, role-aware.** The core never touches pixels itself —
+  it calls an injected strategy. Before touching a single texture it
+  classifies every one by the material slot that references it
+  (`classifyTextures()`): only `baseColor`/`emissive` are photographic
+  **colour**; `normal` maps get their own role; packed
+  `metallicRoughness`, `occlusion`, masks and anything referenced through a
+  slot we cannot enumerate (including extensions) are material **data**.
+  Lossy encoders are then only ever chosen for opaque photographic colour.
+  Normal maps, roughness/metallic, occlusion and alpha cutouts are written
+  losslessly (PNG), because JPEG/WebP chroma subsampling and quantization
+  silently corrupt material data — and a texture used by both a colour and a
+  data slot takes the restrictive role.
+  - *Browser half* (`optimizer-browser-textures.mjs`): `createImageBitmap`
+    decode → per-texture alpha scan → one-time WebP probe → codec choice →
+    canvas downscale. Textures within the preset cap are left alone unless a
+    strictly better codec exists, and a re-encode that would *grow* the bytes
+    is discarded — per texture, not just per file. Because uploads are
+    optimized in the browser, this is the half that matters most in
+    production, so it is verified against a real canvas implementation
+    (real decode, real filtering, real encoders) and not only a stub.
+    Downscaled **normal maps are renormalized** on this path too: canvas
+    filtering averages normalized vectors, which shortens and biases them, so
+    the RGB channels are read back as tangent-space vectors, restored to unit
+    length (pixels too short to carry a direction are left alone) and written
+    back before the lossless PNG encode.
+  - *Headless half* (`scripts/lib/headless-textures.mjs`): a dependency-free
+    pure-JS PNG path (zlib inflate → unfilter → bilinear downscale →
+    re-encode, dropping the alpha channel when the result is opaque) used by
+    the tests and the benchmark. Normal maps are renormalized after
+    filtering, because averaging normalized vectors shortens and biases them.
+    Non-PNG or unsupported PNGs are passed through untouched.
+
+Presets (ratio = target triangle ratio, error = simplifier error bound):
+
+| Preset | Ratio | Error | Texture cap | Lossy quality |
+|--------|-------|-------|-------------|----------------|
+| High | 0.70 | 0.0005 | 2048 px | 0.92 |
+| Balanced | 0.50 | 0.0005 | 1536 px | 0.85 |
+| Smallest | 0.25 | 0.0010 | 1024 px | 0.75 |
+
+An unknown preset key falls back to Balanced instead of failing.
 
 What is actually verified to happen to the written file (checked against
-`@gltf-transform/core@4.5.0` and asserted by the E2E/model checks):
+`@gltf-transform/core@4.5.0` and asserted by the unit tests):
 
 - **Names are preserved.** Nodes, meshes, materials, textures and scenes that
   have names keep them byte-for-byte — `dedup()` does *not* merge differently
@@ -485,6 +554,29 @@ What is actually verified to happen to the written file (checked against
 - **Your original file is never touched.** Only the chosen result is uploaded;
   the local file on disk is untouched. If optimizing would make a file *larger*,
   the original is uploaded instead and you are told why.
+
+### Benchmarking the optimizer
+
+`npm run bench:optimizer` builds a deterministic "real crate" GLB
+(seeded procedural wood textures + a planked, relief-displaced shell, with
+redundant nail meshes, an unreferenced node/mesh/material/texture, a nameless
+node and `extras` blocks everywhere — i.e. what a downloaded model actually
+looks like) and runs the shipping core over it with the headless texture path,
+reporting bytes, triangle counts and per-stage timings for every preset:
+
+```
+$ npm run bench:optimizer
+preset     input     output    shrink         wall     triangles           textures
+high       19.45 MB  10.67 MB  45.1% smaller  31334ms  389,438 → 272,587   4 → 3
+balanced   19.45 MB   7.46 MB  61.6% smaller  20098ms  389,438 → 194,711   4 → 3
+small      19.45 MB   3.29 MB  83.1% smaller  10115ms  389,438 →  97,368   4 → 3
+```
+
+The fixture is a build artifact (`fixtures/`, gitignored) regenerated on
+demand — the same seed always produces the same bytes, so the numbers are
+reproducible. The headless path is lossless (PNG); the browser path
+additionally applies the lossy WebP/JPEG re-encode described above, so real
+uploads shrink further than these numbers.
 
 ## glTF companion files
 
@@ -651,13 +743,26 @@ npm run test:e2e -- --phase=2
   (exact/relative/ambiguous/missing), MIME + extension lookup and download-name
   generation.
 - `tests/preview-cache.test.mjs` pins the viewer's download concurrency: duplicate opens share one request, a superseded caller's abort never kills a request another caller joined (including the join-before-release ordering `openModel` must use), rapid A→B→A ends on the newest model, failures/aborts are never cached, and the LRU bounds + upload handoff behave.
-- `tests/optimizer.test.mjs` runs the *same* `@gltf-transform` pipeline the
-  browser uses (the devDependency must match the version pinned in the import
-  map, and the test fails if it drifts) and asserts what the optimizer promises:
+- `tests/optimizer.test.mjs` imports and runs the *shipping* optimizer core
+  (`public/vault/optimizer-core.mjs` — the same module the browser loads, not a
+  mirror of it; the devDependencies must match the versions pinned in the
+  import map, and the test fails if they drift) and asserts what the optimizer
+  promises:
   existing node/mesh/material/texture/scene names survive, only nameless
   properties get a placeholder, every `extras` block is really gone from the
   written GLB, the original exporter's `generator` string does not survive, and
-  `dedup()` does not merge differently named properties.
+  `dedup()` does not merge differently named properties. It also pins the
+  validated core: container validation codes, preset resolution and freezing,
+  the documented stage order, adaptive stage skipping, simplify/prune/dedup
+  actually doing their jobs, cancellation, a throwing texture strategy never
+  aborting the run, the never-bigger rule, and both texture paths (browser
+  encoder decisions + the headless PNG path).
+- `tests/optimizer-browser-textures.test.mjs` runs the shipping browser
+  texture strategy against a REAL canvas implementation (real image decode,
+  real 2D downscale, real PNG/WebP/JPEG encoders) and asserts with real bytes
+  that normal/roughness/metallic/occlusion textures are written as PNG and
+  never lossily, that photographic colour still gets the WebP win, and that
+  real alpha pixels force the lossless path.
 - `tests/server-helpers.test.mjs` covers the server-side sanitizers,
   path-traversal neutralization, id validation, image sniffing and data-URL
   validation, and asserts the client and server MIME tables stay identical.

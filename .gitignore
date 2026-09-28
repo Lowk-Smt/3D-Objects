@@ -19,3 +19,6 @@
 .DS_Store
 *.tsbuildinfo
 next-env.d.ts
+
+# generated benchmark fixtures + outputs (never commit the binaries)
+/fixtures
