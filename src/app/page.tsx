@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import vaultImportMap from "@/lib/vault-import-map.json";
 
 export const metadata: Metadata = {
   title: "Model Vault — Shared 3D Library",
@@ -260,16 +261,7 @@ export default function HomePage() {
       <script
         type="importmap"
         dangerouslySetInnerHTML={{
-          __html: JSON.stringify({
-            imports: {
-              three: "https://unpkg.com/three@0.169.0/build/three.module.js",
-              "three/addons/": "https://unpkg.com/three@0.169.0/examples/jsm/",
-              "@gltf-transform/core": "https://esm.sh/@gltf-transform/core@4.5.0",
-              "@gltf-transform/functions": "https://esm.sh/@gltf-transform/functions@4.5.0",
-              meshoptimizer: "https://esm.sh/meshoptimizer@0.22.0",
-              mikktspace: "https://esm.sh/mikktspace@1.1.0",
-            },
-          }),
+          __html: JSON.stringify(vaultImportMap),
         }}
       />
       {/* `defer` is implicit for module scripts; it is spelled out here so the

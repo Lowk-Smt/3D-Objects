@@ -18,7 +18,7 @@ const workerPath = path.join(root, 'public', 'vault', 'wireframe-worker.js');
 const source = readFileSync(appPath, 'utf8');
 const workerSource = readFileSync(workerPath, 'utf8');
 const packageJson = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
-const pageSource = readFileSync(path.join(root, 'src', 'app', 'page.tsx'), 'utf8');
+const importMap = JSON.parse(readFileSync(path.join(root, 'src', 'lib', 'vault-import-map.json'), 'utf8'));
 
 /** Body of a top-level function: from its declaration to the next `\n}\n`. */
 function fnBody(text, signature) {
@@ -38,8 +38,8 @@ test('three and @types/three are pinned to exactly 0.169.0', () => {
   const all = { ...packageJson.dependencies, ...packageJson.devDependencies };
   assert.equal(all.three, '0.169.0');
   assert.equal(all['@types/three'], '0.169.0');
-  assert.match(pageSource, /three@0\.169\.0\/build\/three\.module\.js/);
-  assert.match(pageSource, /three@0\.169\.0\/examples\/jsm\//);
+  assert.match(importMap.imports.three, /three@0\.169\.0\/build\/three\.module\.js/);
+  assert.match(importMap.imports['three/addons/'], /three@0\.169\.0\/examples\/jsm\//);
 });
 
 // ---------------------------------------------------------------------------

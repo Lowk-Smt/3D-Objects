@@ -3,9 +3,10 @@
 
    Pure logic only: no DOM, no timers, no console, no globals beyond the
    glTF-Transform / meshoptimizer imports (resolved by the import map in the
-   browser, by node_modules under Node). The browser UI
-   (public/vault/app.js), the unit tests (tests/optimizer.test.mjs) and the
-   headless benchmark (scripts/benchmark-optimizer.mjs) all run THIS module,
+   browser, by node_modules under Node). The browser upload entry
+   (public/vault/optimizer-upload.mjs, called by app.js), the unit tests
+   (tests/optimizer.test.mjs) and the headless benchmark
+   (scripts/benchmark-optimizer.mjs) all run THIS module,
    so what is verified in CI is what ships to the browser.
 
    Pipeline (performance reorder — cheapest structural passes first, and a
