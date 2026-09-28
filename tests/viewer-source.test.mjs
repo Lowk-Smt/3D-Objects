@@ -60,3 +60,56 @@ test("wireframe toggle behavior is preserved", () => {
   assert.match(source, /wireframeOn = !wireframeOn;/);
   assert.match(source, /setWireframeMode\(wireframeOn\);/);
 });
+
+test("animate() has exactly one mixer.update(dt) and exactly one renderer.render(scene, camera)", () => {
+  const animateIndex = source.indexOf("function animate()");
+  assert.notEqual(animateIndex, -1, "animate() must exist");
+  const animateEndIndex = source.indexOf("animate();", animateIndex);
+  const animateBody = source.slice(animateIndex, animateEndIndex);
+
+  const mixerMatches = animateBody.match(/mixer\.update\(/g) || [];
+  assert.equal(mixerMatches.length, 1, "animate() must contain exactly one mixer.update() call");
+
+  const renderMatches = animateBody.match(/renderer\.render\(/g) || [];
+  assert.equal(renderMatches.length, 1, "animate() must contain exactly one renderer.render() call");
+});
+
+test("animate() logs first-render cost, slow frames >=50ms, and renderer.info", () => {
+  assert.match(source, /\[perf\] render:first/);
+  assert.match(source, /\[perf\] render:slow-frame/);
+  assert.match(source, /renderer\.info/);
+  assert.match(source, /renderDuration >= 50/);
+});
+
+test("captureThumb() has exactly one renderer.render and one toDataURL, and splits timings", () => {
+  const thumbIndex = source.indexOf("function captureThumb(");
+  assert.notEqual(thumbIndex, -1, "captureThumb() must exist");
+  const thumbEndIndex = source.indexOf("async function createDependencyUrl", thumbIndex);
+  const thumbBody = source.slice(thumbIndex, thumbEndIndex);
+
+  const renderMatches = thumbBody.match(/renderer\.render\(/g) || [];
+  assert.equal(renderMatches.length, 1, "captureThumb() must contain exactly one renderer.render() call");
+
+  const toDataURLMatches = thumbBody.match(/toDataURL\(/g) || [];
+  assert.equal(toDataURLMatches.length, 1, "captureThumb() must contain exactly one toDataURL() call");
+
+  assert.match(thumbBody, /perf\.time\(['"]thumbnail:render['"]\)/);
+  assert.match(thumbBody, /perf\.time\(['"]thumbnail:readback['"]\)/);
+  assert.match(thumbBody, /perf\.time\(['"]thumbnail:encode['"]\)/);
+});
+
+test("inspectModel() reports meshes, objects, materials, textures, max size, approx memory, skinned meshes", () => {
+  const inspectIndex = source.indexOf("function inspectModel(");
+  assert.notEqual(inspectIndex, -1, "inspectModel() must exist");
+  const inspectEndIndex = source.indexOf("function disposeTree", inspectIndex);
+  const inspectBody = source.slice(inspectIndex, inspectEndIndex);
+
+  assert.match(inspectBody, /isSkinnedMesh/);
+  assert.match(inspectBody, /isMesh/);
+  assert.match(inspectBody, /materials/);
+  assert.match(inspectBody, /textures/);
+  assert.match(inspectBody, /maxTextureSize/);
+  assert.match(inspectBody, /approxTextureMemory/);
+
+  assert.match(source, /\[perf\] model:stats:/);
+});

@@ -699,15 +699,70 @@ resize();
 
 const clock = new THREE.Clock();
 let mixer = null;
+let isFirstRender = false;
+let currentModelName = '';
 
 controls.addEventListener('change', () => { needsRender = true; });
 
 function animate(){
   requestAnimationFrame(animate);
   const dt = clock.getDelta();
-  if (mixer){ mixer.update(dt); needsRender = true; }
+  let mixerDuration = 0;
+  if (mixer){
+    const mixerStart = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    mixer.update(dt);
+    const mixerEnd = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    mixerDuration = Math.round((mixerEnd - mixerStart) * 10) / 10;
+    needsRender = true;
+  }
   controls.update();
-  if (needsRender){ renderer.render(scene, camera); needsRender = false; }
+  if (needsRender){
+    const renderStart = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const wasFirst = isFirstRender;
+    if (wasFirst){
+      try {
+        if (typeof performance !== 'undefined' && performance.mark){
+          performance.mark('vault:render:first:start');
+        }
+      } catch { /* never throw */ }
+    }
+
+    renderer.render(scene, camera);
+    needsRender = false;
+
+    const renderEnd = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const renderDuration = Math.round((renderEnd - renderStart) * 10) / 10;
+
+    if (wasFirst){
+      isFirstRender = false;
+      try {
+        if (typeof performance !== 'undefined' && performance.mark){
+          performance.mark('vault:render:first:end');
+          if (performance.measure){
+            performance.measure('vault:render:first', 'vault:render:first:start', 'vault:render:first:end');
+          }
+        }
+      } catch { /* never throw */ }
+      const rnd = renderer.info ? renderer.info.render : null;
+      const mem = renderer.info ? renderer.info.memory : null;
+      const extra = rnd ? `calls: ${rnd.calls}, triangles: ${rnd.triangles}` : '';
+      console.debug(`[perf] render:first${currentModelName ? `:${currentModelName}` : ''}: ${renderDuration}ms${extra ? ` (${extra})` : ''}`);
+      if (mixer && mixerDuration > 0){
+        console.debug(`[perf] mixer:first: ${mixerDuration}ms`);
+      }
+      if (renderer.info){
+        console.debug(`[perf] renderer.info: render={calls: ${rnd?.calls ?? 0}, triangles: ${rnd?.triangles ?? 0}, points: ${rnd?.points ?? 0}, lines: ${rnd?.lines ?? 0}}, memory={geometries: ${mem?.geometries ?? 0}, textures: ${mem?.textures ?? 0}}`);
+      }
+    } else if (renderDuration >= 50 || mixerDuration >= 50){
+      const rnd = renderer.info ? renderer.info.render : null;
+      const mem = renderer.info ? renderer.info.memory : null;
+      const extra = rnd ? `calls: ${rnd.calls}, triangles: ${rnd.triangles}` : '';
+      console.debug(`[perf] render:slow-frame: ${renderDuration}ms${mixerDuration > 0 ? ` (mixer: ${mixerDuration}ms)` : ''}${extra ? ` (${extra})` : ''}`);
+      if (renderer.info){
+        console.debug(`[perf] renderer.info: render={calls: ${rnd?.calls ?? 0}, triangles: ${rnd?.triangles ?? 0}}, memory={geometries: ${mem?.geometries ?? 0}, textures: ${mem?.textures ?? 0}}`);
+      }
+    }
+  }
 }
 animate();
 
@@ -730,6 +785,116 @@ function cancelPreviewLoad(ids){
   previewToken++;
   previewAbortCtl.controller.abort();
   previewAbortCtl = null;
+}
+
+function inspectModel(root){
+  try {
+    let objectCount = 0;
+    let meshCount = 0;
+    let skinnedMeshCount = 0;
+    const uniqueMaterials = new Set();
+    const uniqueTextures = new Set();
+
+    root.traverse(obj => {
+      objectCount++;
+      if (obj.isSkinnedMesh){
+        skinnedMeshCount++;
+      }
+      if (obj.isMesh){
+        meshCount++;
+      }
+      if (obj.material){
+        const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+        for (const mat of materials){
+          if (!mat) continue;
+          uniqueMaterials.add(mat);
+          for (const key in mat){
+            try {
+              const val = mat[key];
+              if (val && val.isTexture){
+                uniqueTextures.add(val);
+              }
+            } catch { /* getters may throw */ }
+          }
+          if (mat.uniforms){
+            try {
+              for (const uKey in mat.uniforms){
+                const uVal = mat.uniforms[uKey]?.value;
+                if (uVal && uVal.isTexture){
+                  uniqueTextures.add(uVal);
+                }
+              }
+            } catch { /* ignore */ }
+          }
+        }
+      }
+    });
+
+    let maxTextureW = 0;
+    let maxTextureH = 0;
+    let maxTextureDim = 0;
+    let approxTextureBytes = 0;
+
+    for (const tex of uniqueTextures){
+      let w = 0;
+      let h = 0;
+      let bytes = 0;
+
+      if (tex.image){
+        w = tex.image.width || tex.image.naturalWidth || (tex.image.videoWidth || 0);
+        h = tex.image.height || tex.image.naturalHeight || (tex.image.videoHeight || 0);
+        if (tex.image.data && tex.image.data.byteLength){
+          bytes = tex.image.data.byteLength;
+        }
+      } else if (tex.mipmaps && tex.mipmaps.length > 0 && tex.mipmaps[0]){
+        w = tex.mipmaps[0].width || 0;
+        h = tex.mipmaps[0].height || 0;
+        for (const mip of tex.mipmaps){
+          if (mip && mip.data && mip.data.byteLength){
+            bytes += mip.data.byteLength;
+          }
+        }
+      }
+
+      const dim = Math.max(w, h);
+      if (dim > maxTextureDim){
+        maxTextureDim = dim;
+        maxTextureW = w;
+        maxTextureH = h;
+      }
+
+      if (bytes === 0 && w > 0 && h > 0){
+        const mipmapFactor = tex.generateMipmaps !== false ? 1.333 : 1;
+        bytes = Math.round(w * h * 4 * mipmapFactor);
+      }
+      approxTextureBytes += bytes;
+    }
+
+    const maxTextureSize = maxTextureDim > 0 ? `${maxTextureW}x${maxTextureH}` : 'none';
+
+    return {
+      objects: objectCount,
+      meshes: meshCount,
+      skinnedMeshes: skinnedMeshCount,
+      materials: uniqueMaterials.size,
+      textures: uniqueTextures.size,
+      maxTextureSize,
+      approxTextureMemory: fmtSize(approxTextureBytes),
+      approxTextureBytes
+    };
+  } catch (err){
+    console.warn('Model inspection skipped:', err);
+    return {
+      objects: 0,
+      meshes: 0,
+      skinnedMeshes: 0,
+      materials: 0,
+      textures: 0,
+      maxTextureSize: 'none',
+      approxTextureMemory: '0 B',
+      approxTextureBytes: 0
+    };
+  }
 }
 
 function disposeTree(root){
@@ -759,6 +924,8 @@ function clearModel(){
   }
   mixer = null;
   wireframeOn = false;
+  isFirstRender = false;
+  currentModelName = '';
   $('wireBtn').classList.remove('on');
   needsRender = true;
 }
@@ -817,10 +984,14 @@ function captureThumb(size = 200){
   camera.updateProjectionMatrix();
 
   renderer.setRenderTarget(renderTarget);
+  const renderTimer = perf.time('thumbnail:render');
   renderer.render(scene, camera);
+  renderTimer.end();
 
+  const readbackTimer = perf.time('thumbnail:readback');
   const pixels = new Uint8Array(size * size * 4);
   renderer.readRenderTargetPixels(renderTarget, 0, 0, size, size, pixels);
+  readbackTimer.end();
 
   renderer.setRenderTarget(oldTarget);
   grid.visible = oldGrid;
@@ -828,6 +999,7 @@ function captureThumb(size = 200){
   camera.updateProjectionMatrix();
   renderTarget.dispose();
 
+  const encodeTimer = perf.time('thumbnail:encode');
   const canvas = document.createElement('canvas');
   canvas.width = size; canvas.height = size;
   const ctx = canvas.getContext('2d');
@@ -840,7 +1012,10 @@ function captureThumb(size = 200){
   ctx.putImageData(imageData, 0, 0);
   needsRender = true;
 
-  return canvas.toDataURL('image/jpeg', 0.72);
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+  encodeTimer.end();
+
+  return dataUrl;
 }
 
 async function createDependencyUrl(modelMeta, uri, cache, createdUrls){
@@ -1207,6 +1382,15 @@ async function openModel(meta){
 
   scene.add(object);
   current = object;
+  isFirstRender = true;
+  currentModelName = meta.name;
+
+  const stats = inspectModel(object);
+  console.debug(`[perf] model:stats:${meta.name}: ${stats.objects} objects, ${stats.meshes} meshes (${stats.skinnedMeshes} skinned), ${stats.materials} materials, ${stats.textures} textures (max: ${stats.maxTextureSize}, ~${stats.approxTextureMemory} texture memory)`);
+  if (renderer.info){
+    const mem = renderer.info.memory;
+    console.debug(`[perf] renderer.info: memory={geometries: ${mem?.geometries ?? 0}, textures: ${mem?.textures ?? 0}}`);
+  }
 
   if (result.animations && result.animations.length){
     mixer = new THREE.AnimationMixer(object);
