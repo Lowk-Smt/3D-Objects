@@ -86,6 +86,36 @@ export function hostOf(url) {
   }
 }
 
+/**
+ * Strips the ENTIRE query string and fragment from a URL, keeping the
+ * origin (scheme + host) and pathname. Presigned storage URLs carry their
+ * authorization in the query (X-Amz-Signature, AuthorizationToken, …), so a
+ * full transfer URL must never be stored in diagnostic objects or printed
+ * to the console. Absolute URLs are normalized to scheme + host + path
+ * (dropping query, fragment and any embedded credentials); relative URLs
+ * and unparsable strings are cut textually at the first `?` or `#`.
+ */
+export function redactUrl(url) {
+  const raw = String(url ?? "");
+  if (!raw) return "";
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) {
+    // Absolute: normalize to origin + path; query, fragment and any
+    // credentials never survive.
+    try {
+      const parsed = new URL(raw);
+      return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    } catch {
+      /* unparsable absolute URL — fall through to the textual cut */
+    }
+  }
+  const queryAt = raw.indexOf("?");
+  const hashAt = raw.indexOf("#");
+  let cut = raw.length;
+  if (queryAt !== -1) cut = Math.min(cut, queryAt);
+  if (hashAt !== -1) cut = Math.min(cut, hashAt);
+  return raw.slice(0, cut);
+}
+
 /** Compact byte count for log lines: 25162268 -> "24.0MB". */
 export function formatBytes(bytes) {
   const n = Number(bytes);

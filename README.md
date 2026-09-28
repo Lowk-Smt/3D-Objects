@@ -702,8 +702,11 @@ Each line reports the serving host, status, bytes, duration, throughput
 (cache-control, server-timing, `x-vercel-*`/`via` proxy fingerprints, …),
 and the resource-timing breakdown when the browser allows one (phase
 timings are only available with a `Timing-Allow-Origin` header; otherwise
-only total duration is reliable). The old `preview:fetch` timer is still
-logged for continuity, but the console also splits it into
+only total duration is reliable). URLs are always **redacted** before they
+reach diagnostics: the query string and fragment are stripped (scheme,
+host and path only), so presigned signatures such as `X-Amz-Signature` or
+`AuthorizationToken` never appear in the console. The old `preview:fetch`
+timer is still logged for continuity, but the console also splits it into
 `preview:envelope` (the authenticated `/raw` round trip: session auth, file
 lookup, presigning — the part Server-Timing covers) and `preview:transfer`
 (the byte leg itself), so server latency is no longer counted as transfer

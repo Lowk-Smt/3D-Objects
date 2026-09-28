@@ -12,6 +12,7 @@ import {
   formatBytes,
   hostOf,
   pickReadableHeaders,
+  redactUrl,
   throughputMbps,
 } from "../public/vault/transfer-stats.js";
 
@@ -39,6 +40,43 @@ test("hostOf extracts the serving hostname from transfer URLs", () => {
   assert.equal(hostOf("/api/files/x/raw"), null);
   assert.equal(hostOf(""), null);
   assert.equal(hostOf(undefined), null);
+});
+
+test("redactUrl strips the signed query string — presigned URLs are never reported whole", () => {
+  // The exact case called out in review: the signature must not survive.
+  const signed = "https://s3.us-west-004.backblazeb2.com/file.glb?X-Amz-Signature=SECRET";
+  assert.equal(redactUrl(signed), "https://s3.us-west-004.backblazeb2.com/file.glb");
+  assert.ok(!redactUrl(signed).includes("X-Amz-Signature"), "signature param must be gone");
+  assert.ok(!redactUrl(signed).includes("SECRET"), "signature value must be gone");
+
+  // Every query parameter is stripped, along with any fragment, from any
+  // presigned storage URL shape the app produces.
+  const b2 = redactUrl(
+    "https://s3.us-west-004.backblazeb2.com/model-vault/files/abc/model.glb"
+    + "?AuthorizationToken=SECRET&X-Amz-Algorithm=AWS4-HMAC-SHA256&response-content-type=model%2Fgltf-binary#frag",
+  );
+  assert.equal(b2, "https://s3.us-west-004.backblazeb2.com/model-vault/files/abc/model.glb");
+  assert.ok(!b2.includes("SECRET") && !b2.includes("#frag") && !b2.includes("?"));
+
+  // Clean URLs pass through unchanged (still scheme + host + path).
+  assert.equal(
+    redactUrl("https://s3.us-west-004.backblazeb2.com/file.glb"),
+    "https://s3.us-west-004.backblazeb2.com/file.glb",
+  );
+});
+
+test("redactUrl keeps the hostname and pathname, handles relative and unparsable inputs", () => {
+  assert.equal(redactUrl("https://app.vercel.app/api/files/x/raw?proxy=1"), "https://app.vercel.app/api/files/x/raw");
+  assert.equal(redactUrl("/api/files/x/raw?proxy=1"), "/api/files/x/raw");
+  assert.equal(redactUrl("/api/files/x/raw"), "/api/files/x/raw");
+  assert.equal(redactUrl(""), "");
+  assert.equal(redactUrl(undefined), "");
+  assert.equal(redactUrl(null), "");
+  // Unparsable strings: best-effort cut at the first ? or #.
+  assert.equal(redactUrl("weird-url?q=1#f"), "weird-url");
+  assert.equal(redactUrl("weird-url"), "weird-url");
+  // Credentials in a URL never survive either (only origin + path do).
+  assert.equal(redactUrl("https://user:pass@b2.example/file?q=1"), "https://b2.example/file");
 });
 
 test("formatBytes gives compact, stable log labels", () => {

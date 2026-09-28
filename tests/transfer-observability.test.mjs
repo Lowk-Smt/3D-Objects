@@ -117,6 +117,28 @@ test("tests read the actual final source from disk (not a copy)", () => {
   assert.equal(appJsPath, path.join(__dirname, "..", "public", "vault", "app.js"));
 });
 
+test("reported URLs are redacted — signed query strings never reach diagnostics", () => {
+  // The helper exists in the pure module…
+  assert.match(statsSource, /export function redactUrl\(url\)/);
+  // …and is the ONLY path by which a URL enters the diagnostic details:
+  // reportTransfer must store the redacted form, never the raw transfer URL
+  // (presigned GETs and upload URLs carry X-Amz-Signature/AuthorizationToken
+  // in the query — those must never appear in console diagnostics).
+  assert.match(source, /url: redactUrl\(url \|\| ''\)/);
+  assert.doesNotMatch(source, /url: String\(url \|\| ''\)/);
+  // The PerformanceResourceTiming lookup still uses the full URL (it must
+  // match the browser's exact resource entry); redaction is output-only.
+  assert.match(source, /findResourceTiming\(url,/);
+  // The one-line console summary prints host/status but never a URL…
+  const rtStart = source.indexOf("function reportTransfer(");
+  const rtBody = source.slice(rtStart, source.indexOf("\n}", rtStart) + 3);
+  assert.ok(!rtBody.includes("details.url"), "reportTransfer must not print the URL inline");
+  assert.match(rtBody, /host=\$\{details\.host/);
+  // …and the probe echoes redacted targets only.
+  assert.match(source, /console\.warn\('\[perf:transfer\] probe: no presigned URL for', redactUrl\(target\)/);
+  assert.match(source, /hostOf\(url\) \|\| redactUrl\(url\)/);
+});
+
 test("transfer-stats.js stays pure: no imports, no network, no DOM", () => {
   assert.doesNotMatch(statsSource, /^import /m, "must remain dependency-free");
   assert.doesNotMatch(statsSource, /\bfetch\(/, "must not perform network calls");

@@ -25,7 +25,7 @@ import { createPreviewDownloader } from './preview-cache.js';
         which transport carried it, who served it, and how fast it was ---- */
 import {
   describeResourceTiming, findResourceTiming, formatBytes, hostOf,
-  pickReadableHeaders, throughputMbps,
+  pickReadableHeaders, redactUrl, throughputMbps,
 } from './transfer-stats.js';
 
 /* ---- wireframe edge extraction, shared with the worker and the tests ---- */
@@ -273,7 +273,12 @@ function reportTransfer(kind, name, url, getHeader, status, bytes, startedAt, ex
       kind,
       name,
       host: hostOf(url) || null,
-      url: String(url || ''),
+      // Presigned storage URLs carry their authorization in the query
+      // string (X-Amz-Signature, AuthorizationToken, …). Only the redacted
+      // URL (scheme + host + path, no query, no fragment) may reach
+      // diagnostics; the full url below is used solely to locate the
+      // matching PerformanceResourceTiming entry in this same tick.
+      url: redactUrl(url || ''),
       status: status === null || status === undefined ? null : status,
       bytes: Number(bytes) || 0,
       ms,
@@ -522,7 +527,7 @@ if (typeof window !== 'undefined'){
     if (!/^https?:\/\//i.test(url)){
       const info = await apiFetch(`/api/files/${encodeURIComponent(url)}/raw`, {});
       if (!(info && typeof info.url === 'string')){
-        console.warn('[perf:transfer] probe: no presigned URL for', target, '— is this a file id?');
+        console.warn('[perf:transfer] probe: no presigned URL for', redactUrl(target), '— is this a file id?');
         return null;
       }
       url = info.url;
@@ -564,7 +569,7 @@ if (typeof window !== 'undefined'){
       error: r.error,
     })));
     console.info('[perf:transfer] probe details:', rows);
-    console.info('[perf:transfer] probe of', hostOf(url) || url,
+    console.info('[perf:transfer] probe of', hostOf(url) || redactUrl(url),
       '— near-identical ms across attempts with tiny bytes suggests a cache hit;'
       + ' wildly different attempts suggest congestion/throttling on the path.');
     return rows;
