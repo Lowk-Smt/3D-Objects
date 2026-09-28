@@ -67,6 +67,56 @@ test("transfer transports and credentials are unchanged (behavior preservation)"
   assert.match(source, /previewLoader\.seed\(completed\.file\.id, file, file\.size\)/);
 });
 
+test("transfer functions have no unreachable or duplicated statements (final-source guards)", () => {
+  // fetchModelBytes: exactly ONE direct attempt before the network/CORS
+  // fallback; the fallback is reachable only from its catch.
+  const fnStart = source.indexOf("async function fetchModelBytes");
+  const fnBody = source.slice(fnStart, source.indexOf("\n}\n", fnStart) + 3);
+  assert.equal((fnBody.match(/fetchDirectBlob\(/g) || []).length, 1, "exactly one direct fetch attempt");
+  assert.equal((fnBody.match(/fetchProxiedBlob\(/g) || []).length, 1, "exactly one fallback call, in the catch");
+
+  // fetchProxiedBlob: read the body, then report, then return the blob —
+  // never an unconditional `return response.blob()` that would skip reporting.
+  const proxiedStart = source.indexOf("async function fetchProxiedBlob");
+  const proxiedBody = source.slice(proxiedStart, source.indexOf("\n}\n", proxiedStart) + 3);
+  assert.doesNotMatch(proxiedBody, /return response\.blob\(\)/, "no unconditional early return before reporting");
+  const pRead = proxiedBody.indexOf("await response.blob()");
+  const pReport = proxiedBody.indexOf("reportTransfer('preview proxied'");
+  const pReturn = proxiedBody.indexOf("return blob;");
+  assert.ok(pRead !== -1 && pReport !== -1 && pReturn !== -1);
+  assert.ok(pRead < pReport && pReport < pReturn, "order: read body -> reportTransfer -> return blob");
+
+  // fetchDirectBlob: same order on its success path.
+  const directStart = source.indexOf("async function fetchDirectBlob");
+  const directBody = source.slice(directStart, source.indexOf("\n}\n", directStart) + 3);
+  const dRead = directBody.indexOf("await response.blob()");
+  const dReport = directBody.indexOf("reportTransfer('preview direct'");
+  assert.ok(dRead !== -1 && dReport !== -1 && dRead < dReport, "read body -> reportTransfer");
+  assert.ok(directBody.indexOf("return blob;", dReport) > dReport, "blob returned after reporting");
+
+  // preview:envelope covers ONLY the authenticated /raw envelope call, and
+  // preview:transfer starts only after the envelope has fully ended — so the
+  // transfer number is pure byte-leg time.
+  const envStart = fnBody.indexOf("const envelopeTimer = perf.time(`preview:envelope:");
+  const envCall = fnBody.indexOf("await apiFetch(`/api/files/${encodeURIComponent(meta.id)}/raw`");
+  const envEnd = fnBody.indexOf("envelopeTimer.end();");
+  const transferStart = fnBody.indexOf("const transferTimer = perf.time(`preview:transfer:");
+  assert.ok(envStart !== -1 && envCall !== -1 && envEnd !== -1 && transferStart !== -1);
+  assert.ok(envStart < envCall && envCall < envEnd, "envelope timer wraps only the /raw call");
+  assert.ok(envEnd < transferStart, "byte-transfer timer starts after the envelope ended");
+});
+
+test("tests read the actual final source from disk (not a copy)", () => {
+  // Guard against drift between what is tested and what ships: every source
+  // assertion in this file loads public/vault/app.js via readFileSync at run
+  // time — same file the dev server serves from public/.
+  assert.match(
+    readFileSync(new URL("./transfer-observability.test.mjs", import.meta.url), "utf8"),
+    /readFileSync\(appJsPath, "utf8"\)/,
+  );
+  assert.equal(appJsPath, path.join(__dirname, "..", "public", "vault", "app.js"));
+});
+
 test("transfer-stats.js stays pure: no imports, no network, no DOM", () => {
   assert.doesNotMatch(statsSource, /^import /m, "must remain dependency-free");
   assert.doesNotMatch(statsSource, /\bfetch\(/, "must not perform network calls");
