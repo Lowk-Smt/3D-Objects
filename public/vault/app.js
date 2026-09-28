@@ -713,6 +713,7 @@ animate();
 
 let current = null;
 let previewToken = 0;
+let wireframeOn = false;
 /** { id, controller } of the preview load in flight, if any. */
 let previewAbortCtl = null;
 
