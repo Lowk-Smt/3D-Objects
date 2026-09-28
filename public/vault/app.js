@@ -20,6 +20,11 @@ import {
         abort), pure logic shared with tests/preview-cache.test.mjs ---- */
 import { createPreviewDownloader } from './preview-cache.js';
 
+/* ---- wireframe edge extraction, shared with the worker and the tests ---- */
+import {
+  DEFAULT_THRESHOLD_ANGLE, WORKER_FILE_URL, buildWorkerPayload
+} from './wireframe.js';
+
 /* ---- optimization pipeline imports ---- */
 import { WebIO } from '@gltf-transform/core';
 import { simplify, prune, dedup } from '@gltf-transform/functions';
@@ -701,6 +706,11 @@ const clock = new THREE.Clock();
 let mixer = null;
 let isFirstRender = false;
 let currentModelName = '';
+/** 'normal' | 'wireframe' — which overlay the last render reported on. */
+let lastRenderMode = null;
+/* Declared here (not with the model state below) because animate() runs its
+   first frame synchronously during module evaluation and reads it. */
+let wireframeOn = false;
 
 controls.addEventListener('change', () => { needsRender = true; });
 
@@ -732,6 +742,15 @@ function animate(){
 
     const renderEnd = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
     const renderDuration = Math.round((renderEnd - renderStart) * 10) / 10;
+
+    // Report the first frame in each mode: [perf] render:normal:... and
+    // [perf] render:wireframe:... make the two costs directly comparable
+    // around a toggle, which is exactly what the overlay must not regress.
+    const renderMode = wireframeOn ? 'wireframe' : 'normal';
+    if (renderMode !== lastRenderMode){
+      lastRenderMode = renderMode;
+      console.debug(`[perf] render:${renderMode}: ${renderDuration}ms${wasFirst ? ' (first frame)' : ''}`);
+    }
 
     if (wasFirst){
       isFirstRender = false;
@@ -768,7 +787,6 @@ animate();
 
 let current = null;
 let previewToken = 0;
-let wireframeOn = false;
 /** { id, controller } of the preview load in flight, if any. */
 let previewAbortCtl = null;
 
@@ -786,6 +804,18 @@ function cancelPreviewLoad(ids){
   previewAbortCtl.controller.abort();
   previewAbortCtl = null;
 }
+
+/* ============================================================
+   WIREFRAME MATERIALS (module-level, shared, never disposed)
+
+   Both materials are created once and reused by every mesh of every model.
+   They are intentionally excluded from disposeTree() so a model teardown
+   can never dispose a material the next model still needs.
+   ============================================================ */
+
+const wireframeInvisibleMaterial = new THREE.MeshBasicMaterial({ colorWrite: false });
+const wireframeLineMaterial = new THREE.LineBasicMaterial({ color: 0x8fb4ff });
+const WIREFRAME_SHARED_MATERIALS = new Set([wireframeInvisibleMaterial, wireframeLineMaterial]);
 
 function inspectModel(root){
   try {
@@ -909,15 +939,24 @@ function disposeTree(root){
             if (value && value.isTexture) value.dispose();
           }
         } catch { /* getters may throw */ }
-        material.dispose();
+        // Module-level shared materials (see WIREFRAME MATERIALS above) must
+        // survive model teardown — the wireframe overlay swaps meshes onto
+        // wireframeInvisibleMaterial, and disposing it here would break every
+        // model opened afterwards.
+        if (material.isMaterial && !WIREFRAME_SHARED_MATERIALS.has(material)) material.dispose();
       }
     }
   });
 }
 
 function clearModel(){
+  // In-flight wireframe preparation belongs to the outgoing model. Kill the
+  // worker, drop pending tasks, and ignore any results already sitting in the
+  // message queue so a stale callback can never modify the next model.
+  terminateWireframeWorker();
   if (current){
     if (wireframeOn) setWireframeMode(false);
+    disposeWireframeCache(current);
     scene.remove(current);
     disposeTree(current);
     current = null;
@@ -1384,6 +1423,13 @@ async function openModel(meta){
   current = object;
   isFirstRender = true;
   currentModelName = meta.name;
+
+  // Kick off wireframe preparation immediately — off the main thread when a
+  // worker is available. The shaded model renders and stays interactive while
+  // the edges are produced. Failure here must never break the preview.
+  prepareWireframe(object).catch(err => {
+    console.warn('Wireframe preparation failed:', err);
+  });
 
   const stats = inspectModel(object);
   console.debug(`[perf] model:stats:${meta.name}: ${stats.objects} objects, ${stats.meshes} meshes (${stats.skinnedMeshes} skinned), ${stats.materials} materials, ${stats.textures} textures (max: ${stats.maxTextureSize}, ~${stats.approxTextureMemory} texture memory)`);
@@ -2126,30 +2172,384 @@ listEl.addEventListener('click', event => {
 
 $('resetBtn').addEventListener('click', () => { if (current) frameCamera(current); else resetCamera(); });
 
-const wireframeInvisibleMaterial = new THREE.MeshBasicMaterial({ colorWrite: false });
+/* ============================================================
+   WIREFRAME PREPARATION (Web Worker, with a synchronous fallback)
 
+   THREE.EdgesGeometry on a large model is CPU-bound and blocks the main
+   thread for seconds. Instead the edge segments are prepared up front — as
+   soon as a model loads — inside a Web Worker, and the resulting
+   THREE.LineSegments is cached on each mesh. Toggling wireframe then just
+   attaches/detaches the cached line, so ON -> OFF -> ON never recomputes
+   anything on the main thread.
+
+   The worker runs the same shared algorithm as the synchronous fallback
+   (both call extractWireframeEdges in ./wireframe.js). Its output matches
+   THREE.EdgesGeometry@0.169.0 at the 25 degree threshold, validated by direct
+   output-equivalence tests in tests/wireframe-edges.test.mjs, so the CAD-like
+   appearance is preserved.
+
+   Worker failures are always recoverable: any error drops every pending
+   task, and a later preparation builds a fresh worker.
+   ============================================================ */
+
+const WIREFRAME_MODULE_URL = new URL('./wireframe.js', import.meta.url).href;
+
+/**
+ * The Blob URL the worker is constructed from.
+ *
+ * LIFETIME (by design, kept deliberately simple): exactly one blob URL is
+ * created per page — lazily, the first time a model is prepared — and it is
+ * reused for EVERY worker this page constructs, including a replacement worker
+ * built after a failure. It is revoked on `pagehide`, and immediately before a
+ * replacement URL is created (which currently only happens if this code runs
+ * again after a revoke). So it is not one URL per worker.
+ */
+let wireframeWorkerBlobUrl = null;
+
+/** The live worker, or null when none is running (created lazily). */
+let wireframeWorker = null;
+/** Monotonic id assigned to each preparation task. */
+let wireframeTaskSeq = 0;
+/** taskId -> { mesh, token } awaiting a worker result. */
+const wireframePending = new Map();
+
+/**
+ * Resolves to the worker URL, or null when this browser cannot run a worker at
+ * all (the emergency synchronous fallback then owns the feature).
+ *
+ * The worker is shipped as a Blob URL so the app stays a plain static module
+ * with no bundler step. A module worker built from `blob:` has no meaningful
+ * base URL, so its static import of ./wireframe.js is rewritten to the
+ * absolute URL the module is actually served from.
+ *
+ * The URL outlives any single worker: see the lifetime note on
+ * `wireframeWorkerBlobUrl`. It is created once per page here and released by
+ * revokeWireframeWorkerBlobUrl() on `pagehide` (or before being replaced).
+ */
+const wireframeWorkerUrlPromise = (async () => {
+  if (typeof Worker === 'undefined' || typeof Blob === 'undefined'
+      || typeof URL === 'undefined' || !URL.createObjectURL) {
+    return null;
+  }
+  try {
+    const response = await fetch(WORKER_FILE_URL);
+    if (!response.ok) throw new Error(`worker source fetch failed: HTTP ${response.status}`);
+    const source = await response.text();
+    const rewritten = source.replace(
+      /(from\s*['"])\.\/wireframe\.js(['"])/g,
+      (_match, before, after) => `${before}${WIREFRAME_MODULE_URL}${after}`
+    );
+    revokeWireframeWorkerBlobUrl();
+    wireframeWorkerBlobUrl = URL.createObjectURL(new Blob([rewritten], { type: 'text/javascript' }));
+    return wireframeWorkerBlobUrl;
+  } catch (err) {
+    console.warn('Wireframe worker unavailable — edges will be built synchronously', err);
+    return null;
+  }
+})();
+
+function revokeWireframeWorkerBlobUrl(){
+  if (!wireframeWorkerBlobUrl) return;
+  try { URL.revokeObjectURL(wireframeWorkerBlobUrl); } catch { /* already revoked */ }
+  wireframeWorkerBlobUrl = null;
+}
+
+function createWireframeWorker(url){
+  const worker = new Worker(url, { type: 'module' });
+  worker.onmessage = onWireframeWorkerMessage;
+  worker.onerror = onWireframeWorkerError;
+  return worker;
+}
+
+/** Set when `new Worker(...)` itself is not usable, regardless of feature
+    detection — after that every preparation uses the synchronous fallback. */
+let wireframeWorkerUnavailable = false;
+
+function getWireframeWorker(url){
+  if (wireframeWorkerUnavailable) return null;
+  if (!wireframeWorker){
+    try {
+      wireframeWorker = createWireframeWorker(url);
+    } catch (err){
+      wireframeWorkerUnavailable = true;
+      console.warn('Wireframe worker could not be constructed; using synchronous edges', err);
+      return null;
+    }
+  }
+  return wireframeWorker;
+}
+
+/**
+ * Idempotent one-shot completion signal for a queued wireframe task.
+ *
+ * Resolved when the task reaches a terminal state — worker result, worker
+ * failure, cancellation/teardown, or emergency synchronous fallback. This is
+ * what lets the preparation timer measure real elapsed preparation time
+ * instead of queue time.
+ */
+function wireframeCompletion(){
+  let done = false;
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return {
+    promise,
+    settle(){
+      if (done) return;
+      done = true;
+      resolve();
+    }
+  };
+}
+
+function settleWireframeTask(task){
+  if (task && task.completion) task.completion.settle();
+}
+
+/**
+ * Drop the worker and every in-flight task.
+ *
+ * Clearing `wireframePending` is what invalidates stale results: a result that
+ * arrives afterwards finds no task and is ignored, so it can never touch the
+ * model that replaced the one it was computed for. Pending tasks are settled
+ * first so a preparation awaiting them can never hang.
+ */
+function terminateWireframeWorker(){
+  if (wireframeWorker){
+    try { wireframeWorker.terminate(); } catch { /* already gone */ }
+    wireframeWorker = null;
+  }
+  for (const task of wireframePending.values()) settleWireframeTask(task);
+  wireframePending.clear();
+}
+
+function onWireframeWorkerMessage(event){
+  const message = event.data;
+  if (!message) return;
+
+  const task = wireframePending.get(message.id);
+  if (!task) return; // cancelled or superseded — drop the stale result
+  wireframePending.delete(message.id);
+  if (task.token !== previewToken){
+    settleWireframeTask(task); // the model switched while in flight
+    return;
+  }
+
+  if (message.type !== 'result' || !message.positions){
+    console.warn('Wireframe worker failed for one mesh; building its edges synchronously:', message.message);
+    prepareWireframeEdgesSync(task.mesh);
+    settleWireframeTask(task);
+    return;
+  }
+
+  setWireframeLine(task.mesh, edgeGeometryFromPositions(message.positions));
+  if (wireframeOn) applyWireframe(task.mesh);
+  needsRender = true;
+  settleWireframeTask(task);
+}
+
+/** LineSegments geometry from a flat XYZ buffer produced by the worker. */
+function edgeGeometryFromPositions(positions){
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+/**
+ * Worker-level error: no task can be trusted afterwards. Drop them all, kill
+ * the worker (so a fresh one is created on the next preparation) and finish
+ * the orphaned meshes on the main thread.
+ */
+function onWireframeWorkerError(event){
+  console.warn('Wireframe worker failed; falling back to synchronous edges', event && event.message);
+  const orphaned = Array.from(wireframePending.values());
+  // terminate() settles these tasks; the fallback below still runs before the
+  // awaiting preparation continues, so the reported preparation duration
+  // includes the emergency synchronous work.
+  terminateWireframeWorker();
+  for (const task of orphaned){
+    if (task.token === previewToken && task.mesh) prepareWireframeEdgesSync(task.mesh);
+  }
+  needsRender = true;
+}
+
+window.addEventListener('pagehide', () => {
+  terminateWireframeWorker();
+  revokeWireframeWorkerBlobUrl();
+});
+
+/** Cache a prepared edge geometry as this mesh's LineSegments. */
+function setWireframeLine(mesh, geometry){
+  if (!mesh) return;
+  if (mesh.userData._wireLine){
+    // Replacing an existing cache: the old geometry is genuinely dead now.
+    if (mesh.userData._wireLine.parent) mesh.userData._wireLine.parent.remove(mesh.userData._wireLine);
+    mesh.userData._wireLine.geometry.dispose();
+    delete mesh.userData._wireLine;
+  }
+  if (typeof geometry.computeBoundingSphere === 'function') geometry.computeBoundingSphere();
+  const line = new THREE.LineSegments(geometry, wireframeLineMaterial);
+  line.renderOrder = 1;
+  mesh.userData._wireLine = line;
+  mesh.userData._wireframeReady = true;
+}
+
+/**
+ * Release every cached edge geometry for a model being torn down.
+ *
+ * Toggling wireframe OFF deliberately keeps these cached (ON/OFF/ON must not
+ * recompute), so a detached cache would otherwise leak when the model is
+ * discarded. Only the geometry is disposed — the materials are shared
+ * module-level singletons.
+ */
+function disposeWireframeCache(root){
+  root.traverse(obj => {
+    if (!obj.userData) return;
+    if (obj.userData._wireLine){
+      if (obj.userData._wireLine.parent) obj.userData._wireLine.parent.remove(obj.userData._wireLine);
+      obj.userData._wireLine.geometry.dispose();
+      delete obj.userData._wireLine;
+    }
+    delete obj.userData._wireframeReady;
+  });
+}
+
+/**
+ * EMERGENCY synchronous fallback — reached only when Workers are unavailable or
+ * worker messaging genuinely failed.
+ *
+ * This is the only place EdgesGeometry is still constructed. It runs on the
+ * main thread and therefore DOES block rendering for as long as the extraction
+ * takes — the very freeze this feature removes. It exists so the overlay still
+ * works without a worker, and its output matches THREE.EdgesGeometry@0.169.0 at
+ * the 25 degree threshold (validated by tests/wireframe-edges.test.mjs).
+ */
+function prepareWireframeEdgesSync(mesh){
+  if (!mesh || !mesh.geometry || mesh.userData._wireframeReady) return;
+  // Nothing sensible to crease-detect without a position attribute; three.js
+  // would throw. Models without one keep the shaded look only.
+  if (!mesh.geometry.getAttribute || !mesh.geometry.getAttribute('position')) return;
+  const timer = perf.time(`wireframe:prepare-sync:${currentModelName || 'model'}`);
+  try {
+    // The EdgesGeometry is only a source of positions here; the cached
+    // LineSegments gets its own geometry so both paths have identical ownership.
+    const edges = new THREE.EdgesGeometry(mesh.geometry, DEFAULT_THRESHOLD_ANGLE);
+    const positions = edges.getAttribute('position');
+    try {
+      setWireframeLine(mesh, edgeGeometryFromPositions(positions ? positions.array : new Float32Array(0)));
+    } finally {
+      edges.dispose();
+    }
+    if (wireframeOn) applyWireframe(mesh);
+    needsRender = true;
+  } finally {
+    timer.end();
+  }
+}
+
+/**
+ * Prepare the wireframe for a freshly loaded model. Nothing is shown yet: the
+ * normal shaded model renders and stays interactive while the edges are built.
+ */
+async function prepareWireframe(root){
+  if (!root) return;
+  const token = previewToken;
+
+  // "Preparation duration" is measured from here until EVERY mesh wireframe for
+  // this model has been resolved — worker result, worker failure, or emergency
+  // synchronous fallback. It is deliberately NOT the time spent queueing jobs.
+  const totalTimer = perf.time(`wireframe:prepare:${currentModelName || 'model'}`);
+
+  const url = await wireframeWorkerUrlPromise;
+  if (token !== previewToken || current !== root){
+    totalTimer.end('superseded');
+    return;
+  }
+
+  if (!url){
+    // No Worker support at all: the emergency synchronous path runs here and
+    // DOES block the main thread for as long as it takes — which is exactly why
+    // it is only reached when a worker is genuinely unavailable.
+    root.traverse(obj => { if (obj.isMesh && obj.geometry) prepareWireframeEdgesSync(obj); });
+    totalTimer.end('synchronous fallback');
+    return;
+  }
+
+  const completions = [];
+  const queueTimer = perf.time(`wireframe:queue:${currentModelName || 'model'}`);
+  root.traverse(obj => {
+    if (!obj.isMesh || !obj.geometry || obj.userData._wireframeReady) return;
+    const id = ++wireframeTaskSeq;
+    const { message, transfer } = buildWorkerPayload(obj.geometry, id);
+    const completion = wireframeCompletion();
+    completions.push(completion.promise);
+    wireframePending.set(id, { mesh: obj, token, completion });
+    try {
+      const worker = getWireframeWorker(url);
+      if (!worker){
+        wireframePending.delete(id);
+        prepareWireframeEdgesSync(obj);
+        completion.settle();
+        return;
+      }
+      worker.postMessage(message, transfer);
+    } catch (err){
+      wireframePending.delete(id);
+      console.warn('Wireframe worker postMessage failed; using synchronous edges', err);
+      prepareWireframeEdgesSync(obj);
+      completion.settle();
+    }
+  });
+  queueTimer.end(`${completions.length} mesh${completions.length === 1 ? '' : 'es'} queued`);
+
+  if (!completions.length){
+    totalTimer.end('nothing to prepare');
+    return;
+  }
+
+  await Promise.all(completions);
+  totalTimer.end(`${completions.length} resolved`);
+}
+
+
+/** Attach the cached wireframe line + hide the shaded material for one mesh. */
+function applyWireframe(obj){
+  if (!obj.userData._wireLine) return;
+  if (obj.userData._wireLine.parent !== obj) obj.add(obj.userData._wireLine);
+  if (!obj.userData._origMaterial) obj.userData._origMaterial = obj.material;
+  obj.material = wireframeInvisibleMaterial;
+}
+
+/** Detach the cached wireframe line and restore the shaded material.
+
+    The cached edge geometry is deliberately NOT disposed here: an
+    ON -> OFF -> ON sequence reuses it instead of recomputing. It is only
+    released by setWireframeLine (replacement) or disposeTree (teardown). */
+function detachWireframe(obj){
+  if (obj.userData._wireLine && obj.userData._wireLine.parent) obj.remove(obj.userData._wireLine);
+  if (obj.userData._origMaterial){ obj.material = obj.userData._origMaterial; delete obj.userData._origMaterial; }
+}
+
+/**
+ * Toggle the wireframe overlay.
+ *
+ * This function never builds edge geometry. All edge work already happened when
+ * the model loaded (prepareWireframe): either off the main thread in the
+ * worker, or — only when a worker was genuinely unavailable or failed — in the
+ * emergency synchronous fallback, which does block the main thread for as long
+ * as it takes (that work is triggered from the load path, never from here).
+ *
+ * A mesh with no cached line yet is simply still being prepared: the shaded
+ * model keeps rendering and the line attaches itself when the result arrives.
+ */
 function setWireframeMode(enabled){
   if (!current) return;
   current.traverse(obj => {
     if (!obj.isMesh) return;
     if (enabled){
-      if (!obj.userData._wireLine){
-        const edges = new THREE.EdgesGeometry(obj.geometry, 25);
-        const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x8fb4ff }));
-        line.renderOrder = 1;
-        obj.add(line);
-        obj.userData._wireLine = line;
-      }
-      if (!obj.userData._origMaterial) obj.userData._origMaterial = obj.material;
-      obj.material = wireframeInvisibleMaterial;
+      if (obj.userData._wireLine) applyWireframe(obj);
     } else {
-      if (obj.userData._wireLine){
-        obj.remove(obj.userData._wireLine);
-        obj.userData._wireLine.geometry.dispose();
-        obj.userData._wireLine.material.dispose();
-        delete obj.userData._wireLine;
-      }
-      if (obj.userData._origMaterial){ obj.material = obj.userData._origMaterial; delete obj.userData._origMaterial; }
+      detachWireframe(obj);
     }
   });
   needsRender = true;
@@ -2158,7 +2558,12 @@ function setWireframeMode(enabled){
 $('wireBtn').addEventListener('click', event => {
   if (!current) return;
   wireframeOn = !wireframeOn;
-  setWireframeMode(wireframeOn);
+  const timer = perf.time(wireframeOn ? 'wireframe:click-on' : 'wireframe:click-off');
+  try {
+    setWireframeMode(wireframeOn);
+  } finally {
+    timer.end();
+  }
   event.currentTarget.classList.toggle('on', wireframeOn);
 });
 
