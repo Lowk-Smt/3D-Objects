@@ -66,6 +66,19 @@ export const REPORTED_HEADERS = [
 ];
 
 /**
+ * Headers that are actually readable via XHR.getResponseHeader() after a
+ * cross-origin PUT to B2 with the documented CORS rules. B2's CORS config
+ * only exposes ETag for PUT (see README), and simple response headers are
+ * always readable but not meaningful for a PUT with an empty body. Limiting
+ * the probe to this small set avoids asking for 20+ headers that will always
+ * be null on the upload path and makes the diagnostics match what the
+ * browser can actually see.
+ */
+export const XHR_READABLE_HEADERS = [
+  "etag",
+];
+
+/**
  * Throughput in megabits per second — one formula everywhere so console
  * numbers and tests agree. Returns null for non-measurable inputs instead
  * of Infinity/NaN.
