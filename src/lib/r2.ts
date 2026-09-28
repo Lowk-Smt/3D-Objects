@@ -65,6 +65,18 @@ export type R2Config = {
 export const PRESIGNED_PUT_EXPIRES_IN_SECONDS = 5 * 60;
 export const PRESIGNED_GET_EXPIRES_IN_SECONDS = 5 * 60;
 
+/**
+ * Preview downloads (`GET /api/files/:id/raw`) hand the browser a presigned
+ * GET so model bytes can flow straight from the private bucket instead of
+ * being proxied through the serverless function. The URL is minted only
+ * after session authentication + file lookup, grants exactly one object key,
+ * and expires quickly on purpose: long enough for the browser to start the
+ * fetch it was just told to make, short enough that a leaked URL is nearly
+ * worthless. The client treats any storage 403 as "link expired — try again"
+ * (a retry mints a fresh URL).
+ */
+export const PRESIGNED_GET_PREVIEW_EXPIRES_IN_SECONDS = 120;
+
 function readEnv(name: string): string {
   return (process.env[name] || "").trim();
 }

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 // under test have no runtime dependencies, so no build step is needed.
 import {
   MIME_BY_EXT,
+  canPresignPreviewMime,
   decodeImageDataUrl,
   getExt,
   getMimeForName,
@@ -148,3 +149,32 @@ test("ServerTiming records elapsed duration even when an operation throws", asyn
   assert.ok(header.includes("failing_async;dur="));
 });
 
+
+test("canPresignPreviewMime gates active-content types out of presigned preview URLs", () => {
+  // Every model/asset MIME the vault mints is safe to presign.
+  for (const mime of Object.values(MIME_BY_EXT)) {
+    if (mime === "image/svg+xml") continue;
+    assert.equal(canPresignPreviewMime(mime), true, `${mime} should be presignable`);
+  }
+  assert.equal(canPresignPreviewMime("application/octet-stream"), true);
+
+  // Active content must keep flowing through the authenticated route (which
+  // adds CSP sandbox + nosniff), never via a direct bucket URL.
+  for (const mime of [
+    "text/html",
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "text/xml",
+    "application/xml",
+    "application/xslt+xml",
+  ]) {
+    assert.equal(canPresignPreviewMime(mime), false, `${mime} must be proxied`);
+  }
+
+  // Parameters and case are normalized; empty/unknown-falsy mime is proxied.
+  assert.equal(canPresignPreviewMime("text/html; charset=utf-8"), false);
+  assert.equal(canPresignPreviewMime("IMAGE/SVG+XML"), false);
+  assert.equal(canPresignPreviewMime(""), false);
+  assert.equal(canPresignPreviewMime(null), false);
+  assert.equal(canPresignPreviewMime(undefined), false);
+});
