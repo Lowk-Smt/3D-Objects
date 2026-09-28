@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 
 import {
   REPORTED_HEADERS,
+  XHR_READABLE_HEADERS,
   describeResourceTiming,
   findResourceTiming,
   formatBytes,
@@ -203,4 +204,50 @@ test("describeResourceTiming detects cache hits (transferSize 0 with a decoded b
   });
   assert.equal(cached.fromCache, true);
   assert.equal(describeResourceTiming(null), null);
+});
+
+test("XHR_READABLE_HEADERS is a small, lowercase subset for XHR PUT diagnostics", () => {
+  assert.ok(Array.isArray(XHR_READABLE_HEADERS), "XHR_READABLE_HEADERS must be an array");
+  assert.ok(XHR_READABLE_HEADERS.length >= 1, "must contain at least one header");
+  assert.ok(XHR_READABLE_HEADERS.length < REPORTED_HEADERS.length, "XHR set must be smaller than REPORTED_HEADERS");
+  // All entries must be lowercase strings, no duplicates, and part of REPORTED_HEADERS.
+  const seen = new Set();
+  for (const h of XHR_READABLE_HEADERS) {
+    assert.equal(typeof h, "string", `header ${h} must be a string`);
+    assert.equal(h, h.toLowerCase(), `header ${h} must be lowercase`);
+    assert.ok(h.length > 0, "header must not be empty");
+    assert.ok(!seen.has(h), `duplicate header ${h}`);
+    seen.add(h);
+    assert.ok(REPORTED_HEADERS.includes(h), `XHR header ${h} must be part of REPORTED_HEADERS`);
+  }
+  // The documented B2 CORS rule only exposes ETag for PUT — that must be present.
+  assert.ok(XHR_READABLE_HEADERS.includes("etag"), "XHR set must include etag (the only header B2 CORS exposes for PUT)");
+  // Proxy/CDN fingerprints and cache-diagnostic headers are never readable via XHR PUT
+  // with the current CORS config and must not be probed on the upload path.
+  for (const notExpected of ["x-vercel-cache", "x-vercel-id", "x-vercel-h", "via", "cf-cache-status", "x-cache", "server-timing", "timing-allow-origin"]) {
+    assert.ok(!XHR_READABLE_HEADERS.includes(notExpected), `XHR set must not include ${notExpected} — not readable via XHR PUT`);
+  }
+});
+
+test("pickReadableHeaders with XHR_READABLE_HEADERS only probes the XHR subset", () => {
+  const asked = [];
+  const exposed = new Map([
+    ["etag", '"abc123"'],
+    ["content-type", "model/gltf-binary"], // not in XHR set, should not be asked
+    ["x-vercel-cache", "MISS"], // not in XHR set
+  ]);
+  const out = pickReadableHeaders((name) => {
+    asked.push(name);
+    return exposed.get(name) ?? null;
+  }, XHR_READABLE_HEADERS);
+  // Only XHR headers should have been asked.
+  assert.deepEqual(new Set(asked), new Set(XHR_READABLE_HEADERS), "getter must be asked exactly for XHR_READABLE_HEADERS");
+  assert.deepEqual(out, { etag: '"abc123"' }, "only etag should be returned for the XHR subset");
+  // Probing the full set would ask for many more headers — the cleanup avoids that.
+  const fullAsked = [];
+  pickReadableHeaders((name) => {
+    fullAsked.push(name);
+    return null;
+  }, REPORTED_HEADERS);
+  assert.ok(fullAsked.length > XHR_READABLE_HEADERS.length, "full set must be larger than XHR set");
 });

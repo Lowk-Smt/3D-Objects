@@ -175,3 +175,43 @@ test("transfer-stats.js stays pure: no imports, no network, no DOM", () => {
   assert.doesNotMatch(statsSource, /\bwindow\b/, "must not touch browser globals");
   assert.doesNotMatch(statsSource, /\bdocument\b/);
 });
+
+test("XHR diagnostics use XHR_READABLE_HEADERS (cleanup wiring)", () => {
+  // The pure module must export the XHR-specific header list.
+  assert.match(statsSource, /export const XHR_READABLE_HEADERS/);
+  assert.match(statsSource, /\"etag\"/, "XHR set must include etag");
+  // app.js must import it and use it for the upload PUT path only.
+  assert.match(source, /XHR_READABLE_HEADERS/, "app.js must reference XHR_READABLE_HEADERS");
+  assert.match(source, /from '\.\/transfer-stats\.js'/, "import must come from transfer-stats.js");
+  // Upload PUT reporting must pass XHR_READABLE_HEADERS to reportTransfer.
+  const uploadReportIdx = source.indexOf("reportTransfer('upload PUT'");
+  assert.ok(uploadReportIdx !== -1, "upload PUT reportTransfer call must exist");
+  const uploadSnippet = source.slice(uploadReportIdx, uploadReportIdx + 500);
+  assert.match(uploadSnippet, /XHR_READABLE_HEADERS/, "upload PUT must use XHR_READABLE_HEADERS");
+  // reportTransfer must accept a headerNames argument and forward it to pickReadableHeaders.
+  assert.match(source, /function reportTransfer\(.*headerNames/);
+  assert.match(source, /pickReadableHeaders\(getHeader, headerNames\)/);
+  // Preview paths must NOT use XHR_READABLE_HEADERS — they keep the full REPORTED_HEADERS set
+  // (default behavior of pickReadableHeaders).
+  const directIdx = source.indexOf("reportTransfer('preview direct'");
+  const proxiedIdx = source.indexOf("reportTransfer('preview proxied'");
+  assert.ok(directIdx !== -1 && proxiedIdx !== -1);
+  const directSnippet = source.slice(directIdx, directIdx + 300);
+  const proxiedSnippet = source.slice(proxiedIdx, proxiedIdx + 400);
+  assert.doesNotMatch(directSnippet, /XHR_READABLE_HEADERS/, "preview direct must not use XHR_READABLE_HEADERS");
+  assert.doesNotMatch(proxiedSnippet, /XHR_READABLE_HEADERS/, "preview proxied must not use XHR_READABLE_HEADERS");
+});
+
+test("XHR_READABLE_HEADERS is documented and stays minimal", () => {
+  // Guard against the XHR set growing back to the full list: it must be defined as a small array
+  // and must be a subset of REPORTED_HEADERS (enforced in transfer-stats.test.mjs as well, but
+  // this file guards the wiring side).
+  const xhrMatch = statsSource.match(/export const XHR_READABLE_HEADERS = \[([\s\S]*?)\];/);
+  assert.ok(xhrMatch, "XHR_READABLE_HEADERS definition must be found");
+  const body = xhrMatch[1];
+  const headers = body.split(",").map((s) => s.trim().replace(/['\"]/g, "")).filter(Boolean);
+  assert.ok(headers.length >= 1 && headers.length <= 5, `XHR set should stay minimal (1-5 entries), got ${headers.length}`);
+  assert.ok(headers.includes("etag"), "must include etag");
+  // Ensure the file still defines REPORTED_HEADERS as the comprehensive set.
+  assert.match(statsSource, /export const REPORTED_HEADERS = \[/);
+});

@@ -26,6 +26,7 @@ import { createPreviewDownloader } from './preview-cache.js';
 import {
   describeResourceTiming, findResourceTiming, formatBytes, hostOf,
   pickReadableHeaders, redactUrl, throughputMbps,
+  XHR_READABLE_HEADERS,
 } from './transfer-stats.js';
 
 /* ---- wireframe edge extraction, shared with the worker and the tests ---- */
@@ -265,7 +266,7 @@ function nowMs(){
  * best-effort — cross-origin responses only expose what the bucket's CORS
  * rules allow, and this must never break the transfer it describes.
  */
-function reportTransfer(kind, name, url, getHeader, status, bytes, startedAt, extra){
+function reportTransfer(kind, name, url, getHeader, status, bytes, startedAt, extra, headerNames){
   try {
     const ms = Math.max(1, Math.round(nowMs() - startedAt));
     const mbps = throughputMbps(bytes, ms);
@@ -283,7 +284,7 @@ function reportTransfer(kind, name, url, getHeader, status, bytes, startedAt, ex
       bytes: Number(bytes) || 0,
       ms,
       mbps,
-      headers: pickReadableHeaders(getHeader),
+      headers: pickReadableHeaders(getHeader, headerNames),
       resourceTiming: (() => {
         const rt = findResourceTiming(url, typeof performance !== 'undefined' ? performance : null);
         return rt ? describeResourceTiming(rt) : null;
@@ -454,7 +455,7 @@ function uploadWithProgress(file, relPath, extra, onProgress){
         // storage redirected).
         reportTransfer('upload PUT', file.name, xhr.responseURL || uploadUrl,
           (h) => { try { return xhr.getResponseHeader(h); } catch { return null; } },
-          xhr.status, file.size, putStartedAt);
+          xhr.status, file.size, putStartedAt, undefined, XHR_READABLE_HEADERS);
         resolve();
       }
       else reject(new ApiClientError(xhr.status, `The direct upload to storage failed (${xhr.status}). Please try again.`));

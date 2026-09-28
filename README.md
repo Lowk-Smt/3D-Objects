@@ -698,13 +698,20 @@ be attributed without guessing:
   network time.
 
 Each line reports the serving host, status, bytes, duration, throughput
-(~Mbps), whatever response headers the origin exposed cross-origin
-(cache-control, server-timing, `x-vercel-*`/`via` proxy fingerprints, …),
-and the resource-timing breakdown when the browser allows one (phase
-timings are only available with a `Timing-Allow-Origin` header; otherwise
-only total duration is reliable). URLs are always **redacted** before they
-reach diagnostics: the query string and fragment are stripped (scheme,
-host and path only), so presigned signatures such as `X-Amz-Signature` or
+(~Mbps), whatever response headers the origin exposed cross-origin, and the
+resource-timing breakdown when the browser allows one (phase timings are only
+available with a `Timing-Allow-Origin` header; otherwise only total duration
+is reliable). Preview transfers (`preview direct` / `preview proxied`) report
+the full `REPORTED_HEADERS` set (cache-control, server-timing,
+`x-vercel-*`/`via` proxy fingerprints, `timing-allow-origin`, …) because
+those headers are readable via `fetch` when the bucket's CORS allows them;
+upload transfers (`upload PUT`) report only `XHR_READABLE_HEADERS`
+(`etag`) — B2's documented CORS rules for `s3_put` only expose `ETag` via
+`exposeHeaders`, and `XMLHttpRequest.getResponseHeader()` can only read that
+plus simple response headers, so probing 20+ headers that will always be null
+on the upload path is avoided. URLs are always **redacted** before they reach
+diagnostics: the query string and fragment are stripped (scheme, host and path
+only), so presigned signatures such as `X-Amz-Signature` or
 `AuthorizationToken` never appear in the console. The old `preview:fetch`
 timer is still logged for continuity, but the console also splits it into
 `preview:envelope` (the authenticated `/raw` round trip: session auth, file
