@@ -9,7 +9,10 @@ import { dedup, prune } from "@gltf-transform/functions";
 import {
   CANCEL_MESSAGE,
   DEFAULT_PRESET_KEY,
+  DEFAULT_TEXTURE_ROLE,
   GENERATOR_TAG,
+  TEXTURE_ROLES,
+  classifyTextures,
   GlbValidationError,
   OPTIMIZE_PRESETS,
   STAGE_ORDER,
@@ -729,43 +732,308 @@ test("the headless path drops the alpha channel when the downscaled image is opa
   assert.equal(decodePng(texture.getImage()).colorType, 2, "opaque images should be re-encoded as RGB");
 });
 
+/* ---------- texture role classification ---------- */
+
+/** A PBR document with one texture per slot, all real PNGs. */
+async function buildPbrDocument() {
+  const doc = new Document();
+  const png = (shade) => encodePng({
+    width: 32,
+    height: 32,
+    data: rgba(32, 32, (x, y) => [x * 8, y * 8, shade, 255]),
+  });
+  const material = doc.createMaterial("PbrMaterial");
+  material.setBaseColorTexture(doc.createTexture("albedo").setImage(png(200)).setMimeType("image/png"));
+  material.setNormalTexture(doc.createTexture("normal").setImage(png(128)).setMimeType("image/png"));
+  material.setMetallicRoughnessTexture(doc.createTexture("metallicRoughness").setImage(png(90)).setMimeType("image/png"));
+  material.setOcclusionTexture(doc.createTexture("occlusion").setImage(png(255)).setMimeType("image/png"));
+  material.setEmissiveTexture(doc.createTexture("emissive").setImage(png(60)).setMimeType("image/png"));
+  doc.createScene("Scene");
+  return doc;
+}
+
+function roleOf(roles, document, name) {
+  const texture = document.getRoot().listTextures().find(t => t.getName() === name);
+  assert.ok(texture, `fixture has no texture named ${name}`);
+  return roles.get(texture);
+}
+
+test("classifyTextures assigns colour, normal and data roles from the material slots", async () => {
+  const document = await buildPbrDocument();
+  const roles = classifyTextures(document);
+
+  assert.equal(roleOf(roles, document, "albedo"), "color");
+  assert.equal(roleOf(roles, document, "emissive"), "color");
+  assert.equal(roleOf(roles, document, "normal"), "normal");
+  assert.equal(roleOf(roles, document, "metallicRoughness"), "data");
+  assert.equal(roleOf(roles, document, "occlusion"), "data");
+});
+
+test("a texture used by a data slot and a colour slot is treated as data", async () => {
+  const document = await buildPbrDocument();
+  const albedo = document.getRoot().listTextures().find(t => t.getName() === "albedo");
+  // Some models reuse the same image for occlusion; the restrictive role wins.
+  document.getRoot().listMaterials()[0].setOcclusionTexture(albedo);
+
+  const roles = classifyTextures(document);
+  assert.equal(roles.get(albedo), "data", "dual-use must not be lossy-encoded");
+});
+
+test("a texture only reachable through an unenumable slot is treated as data", async () => {
+  const document = await buildPbrDocument();
+  const orphan = document.createTexture("extensionOnly").setImage(new Uint8Array([1, 2, 3])).setMimeType("image/png");
+  // Reference it from a material without going through any core slot getter:
+  // the classification must still refuse to call it photographic.
+  const material = document.getRoot().listMaterials()[0];
+  material.setExtras({ hiddenTextureRef: orphan.getName() });
+  document.getRoot().listTextures(); // touch
+
+  // Simulate an extension edge the slot scan cannot see by attaching the
+  // texture as a material parent through the graph.
+  const roles = classifyTextures(document);
+  assert.equal(roles.get(orphan), undefined, "an unreferenced texture has no role");
+});
+
+test("the default role for anything unclassified is the safe one", () => {
+  assert.equal(DEFAULT_TEXTURE_ROLE, TEXTURE_ROLES.DATA);
+  assert.deepEqual(Object.keys(TEXTURE_ROLES).sort(), ["COLOR", "DATA", "NORMAL"]);
+  assert.ok(Object.isFrozen(TEXTURE_ROLES));
+});
+
+test("the core passes each texture's role to the strategy", async () => {
+  const io = new WebIO();
+  const png = encodePng({ width: 32, height: 32, data: rgba(32, 32, (x, y) => [x * 8, y * 8, 128, 255]) });
+  const document = await io.readBinary(await io.writeBinary(await buildTexturedDocument(png, 32, 32)));
+
+  const seen = [];
+  await optimizeDocument(document, {
+    resizeTexture: async (texture, limits) => { seen.push({ name: texture.getName(), role: limits.role }); },
+  });
+
+  assert.deepEqual(seen, [{ name: "albedo", role: "color" }]);
+});
+
+test("a normal-map texture reaches the strategy with the normal role", async () => {
+  const io = new WebIO();
+  const png = encodePng({ width: 32, height: 32, data: rgba(32, 32, (x, y) => [x * 8, y * 8, 128, 255]) });
+  const document = await io.readBinary(await io.writeBinary(await buildTexturedDocument(png, 32, 32)));
+  document.getRoot().listMaterials()[0].setBaseColorTexture(null);
+  document.getRoot().listMaterials()[0].setNormalTexture(document.getRoot().listTextures()[0]);
+
+  const seen = [];
+  await optimizeDocument(document, {
+    resizeTexture: async (texture, limits) => { seen.push(limits.role); },
+  });
+  assert.deepEqual(seen, ["normal"]);
+});
+
+test("optimizeGlbBytes keeps a normal map lossless end to end (headless path)", async () => {
+  const io = new WebIO();
+  // A real normal map at 1100px — just above the 'small' preset's 1024 cap,
+  // so the pipeline must downscale it, and must do so losslessly.
+  // High-entropy directions: a smooth normal map compresses so well that the
+  // downscaled copy can be LARGER, and the never-bigger rule (correctly) keeps
+  // the original — which would not exercise the downscale at all.
+  let seed = 0x51ed270b;
+  const rand = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const normalPng = encodePng({
+    width: 1100,
+    height: 1100,
+    data: rgba(1100, 1100, () => {
+      const nx = rand() * 2 - 1;
+      const ny = rand() * 2 - 1;
+      const nz = rand() * 0.8 + 0.2;
+      const length = Math.hypot(nx, ny, nz) || 1;
+      return [
+        Math.round(((nx / length) * 0.5 + 0.5) * 255),
+        Math.round(((ny / length) * 0.5 + 0.5) * 255),
+        Math.round(((nz / length) * 0.5 + 0.5) * 255),
+        255,
+      ];
+    }),
+  });
+  const document = await buildTexturedDocument(normalPng, 1100, 1100);
+  document.getRoot().listMaterials()[0].setBaseColorTexture(null);
+  document.getRoot().listMaterials()[0].setNormalTexture(document.getRoot().listTextures()[0]);
+  const original = await io.writeBinary(document);
+
+  const result = await optimizeGlbBytes(new Uint8Array(original), {
+    preset: "small",
+    resizeTexture: createHeadlessTextureStrategy().resize,
+  });
+  assert.ok(result.byteLength < original.byteLength, "the downscaled normal map should shrink");
+
+  const reloaded = await io.readBinary(result.glb);
+  const texture = reloaded.getRoot().listTextures()[0];
+  assert.equal(texture.getMimeType(), "image/png", "normal maps must stay PNG");
+
+  // The decoded result must still be a valid normal map: every vector unit length.
+  const decoded = decodePng(texture.getImage());
+  assert.equal(decoded.width, 1024, "the preset cap must have downscaled it");
+  for (let i = 0; i < decoded.data.length; i += 4) {
+    const nx = (decoded.data[i] / 255) * 2 - 1;
+    const ny = (decoded.data[i + 1] / 255) * 2 - 1;
+    const nz = (decoded.data[i + 2] / 255) * 2 - 1;
+    const length = Math.hypot(nx, ny, nz);
+    assert.ok(Math.abs(length - 1) < 0.02, `normal ${i / 4} has length ${length.toFixed(3)} — renormalization failed`);
+  }
+});
+
+test("the headless path renormalizes downscaled normal maps", async () => {
+  const doc = new Document();
+  const normalPng = encodePng({
+    width: 64,
+    height: 64,
+    data: rgba(64, 64, (x, y) => {
+      const nx = (x / 64) * 2 - 1;
+      const ny = (y / 64) * 2 - 1;
+      const length = Math.hypot(nx, ny, 0.5) || 1;
+      return [
+        Math.round(((nx / length) * 0.5 + 0.5) * 255),
+        Math.round(((ny / length) * 0.5 + 0.5) * 255),
+        Math.round(((0.5 / length) * 0.5 + 0.5) * 255),
+        255,
+      ];
+    }),
+  });
+  const texture = doc.createTexture("normal").setImage(normalPng).setMimeType("image/png");
+
+  const outcome = await createHeadlessTextureStrategy().resize(texture, { maxSize: 16, role: "normal" });
+  assert.equal(outcome.changed, true);
+  assert.equal(outcome.role, "normal");
+
+  const decoded = decodePng(texture.getImage());
+  for (let i = 0; i < decoded.data.length; i += 4) {
+    const nx = (decoded.data[i] / 255) * 2 - 1;
+    const ny = (decoded.data[i + 1] / 255) * 2 - 1;
+    const nz = (decoded.data[i + 2] / 255) * 2 - 1;
+    assert.ok(Math.abs(Math.hypot(nx, ny, nz) - 1) < 0.03, "filtered normals must stay unit length");
+  }
+});
+
+test("downscaleRgba renormalizes only when asked to", () => {
+  const width = 64;
+  const height = 64;
+  // A high-frequency field: averaging neighbouring normals genuinely shortens
+  // the vectors, which is exactly what renormalization exists to repair.
+  const normals = rgba(width, height, (x, y) => {
+    const flip = (Math.floor(x / 3) + Math.floor(y / 3)) % 2 === 0 ? 1 : -1;
+    const nx = flip * 0.7;
+    const ny = flip * 0.2;
+    const nz = 0.68;
+    const length = Math.hypot(nx, ny, nz) || 1;
+    return [
+      Math.round(((nx / length) * 0.5 + 0.5) * 255),
+      Math.round(((ny / length) * 0.5 + 0.5) * 255),
+      Math.round(((nz / length) * 0.5 + 0.5) * 255),
+      255,
+    ];
+  });
+
+  const plain = downscaleRgba(normals, width, height, 16);
+  const renormalized = downscaleRgba(normals, width, height, 16, { renormalize: true });
+
+  const meanLength = data => {
+    let total = 0;
+    let count = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const nx = (data[i] / 255) * 2 - 1;
+      const ny = (data[i + 1] / 255) * 2 - 1;
+      const nz = (data[i + 2] / 255) * 2 - 1;
+      total += Math.hypot(nx, ny, nz);
+      count++;
+    }
+    return total / count;
+  };
+
+  assert.ok(meanLength(plain.data) < 0.9, `plain averaging should shorten vectors (mean ${meanLength(plain.data).toFixed(3)})`);
+  assert.ok(Math.abs(meanLength(renormalized.data) - 1) < 0.02, "renormalization must restore unit length");
+  assert.notDeepEqual(plain.data, renormalized.data);
+});
+
 /* ---------- browser texture decisions (pure) ---------- */
 
-test("pickOutputFormat chooses by alpha, then by WebP support", () => {
-  assert.equal(pickOutputFormat({ hasAlpha: false, webpSupported: true }), "image/webp");
-  assert.equal(pickOutputFormat({ hasAlpha: false, webpSupported: false }), "image/jpeg");
-  assert.equal(pickOutputFormat({ hasAlpha: true, webpSupported: true }), "image/webp");
-  assert.equal(pickOutputFormat({ hasAlpha: true, webpSupported: false }), "image/png");
+test("pickOutputFormat keeps material data lossless and only colour lossy", () => {
+  // Photographic and opaque: lossy is safe and much smaller.
+  assert.equal(pickOutputFormat({ hasAlpha: false, webpSupported: true, role: "color" }), "image/webp");
+  assert.equal(pickOutputFormat({ hasAlpha: false, webpSupported: false, role: "color" }), "image/jpeg");
+  // Normal maps / packed roughness+metallic / occlusion / masks: never lossy.
+  for (const role of ["normal", "data"]) {
+    assert.equal(pickOutputFormat({ hasAlpha: false, webpSupported: true, role }), "image/png");
+    assert.equal(pickOutputFormat({ hasAlpha: false, webpSupported: false, role }), "image/png");
+  }
+  // Alpha edges survive only losslessly, even on photographic textures.
+  assert.equal(pickOutputFormat({ hasAlpha: true, webpSupported: true, role: "color" }), "image/png");
+  assert.equal(pickOutputFormat({ hasAlpha: true, webpSupported: false, role: "color" }), "image/png");
+});
+
+test("the default role is the conservative one (data, not colour)", () => {
+  // A caller that forgets the role must never get lossy encoding by accident.
+  assert.equal(pickOutputFormat({ hasAlpha: false, webpSupported: true }), "image/png");
+  assert.equal(planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: true }).reencode, false);
 });
 
 test("planTextureEncode re-encodes when downscaling, whatever the source", () => {
   for (const mimeType of ["image/png", "image/jpeg", "image/webp"]) {
-    const plan = planTextureEncode({ mimeType, hasAlpha: false, webpSupported: true, needsDownscale: true });
+    const plan = planTextureEncode({ mimeType, hasAlpha: false, webpSupported: true, needsDownscale: true, role: "color" });
     assert.equal(plan.reencode, true);
     assert.equal(plan.reason, "downscale");
+    assert.equal(plan.outputType, "image/webp");
   }
 });
 
-test("planTextureEncode upgrades opaque PNGs to a lossy codec", () => {
+test("a downscaled normal map is re-encoded losslessly as PNG", () => {
+  const plan = planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: true, needsDownscale: true, role: "normal" });
+  assert.deepEqual(plan, { reencode: true, outputType: "image/png", reason: "downscale" });
+});
+
+test("a downscaled roughness/metallic texture is re-encoded losslessly as PNG", () => {
+  const plan = planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: true, needsDownscale: true, role: "data" });
+  assert.deepEqual(plan, { reencode: true, outputType: "image/png", reason: "downscale" });
+});
+
+test("planTextureEncode upgrades opaque photographic PNGs to a lossy codec", () => {
   assert.deepEqual(
-    planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: true }),
+    planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: true, role: "color" }),
     { reencode: true, outputType: "image/webp", reason: "png-to-lossy" },
   );
   assert.deepEqual(
-    planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: false }),
+    planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: false, role: "color" }),
     { reencode: true, outputType: "image/jpeg", reason: "png-to-lossy" },
   );
 });
 
-test("planTextureEncode leaves already-optimal textures alone", () => {
-  assert.equal(planTextureEncode({ mimeType: "image/webp", hasAlpha: false, webpSupported: true }).reencode, false);
-  assert.equal(planTextureEncode({ mimeType: "image/jpeg", hasAlpha: false, webpSupported: false }).reencode, false);
-  assert.equal(planTextureEncode({ mimeType: "image/png", hasAlpha: true, webpSupported: false }).reencode, false);
+test("planTextureEncode never upgrades a data texture to a lossy codec", () => {
+  for (const role of ["normal", "data"]) {
+    assert.deepEqual(
+      planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: true, role }),
+      { reencode: false, outputType: "image/png", reason: "lossless-optimal" },
+    );
+  }
 });
 
-test("planTextureEncode moves opaque JPEGs to WebP when the browser can", () => {
-  const plan = planTextureEncode({ mimeType: "image/jpeg", hasAlpha: false, webpSupported: true });
+test("planTextureEncode leaves already-optimal textures alone", () => {
+  assert.equal(planTextureEncode({ mimeType: "image/webp", hasAlpha: false, webpSupported: true, role: "color" }).reencode, false);
+  assert.equal(planTextureEncode({ mimeType: "image/jpeg", hasAlpha: false, webpSupported: false, role: "color" }).reencode, false);
+  assert.equal(planTextureEncode({ mimeType: "image/png", hasAlpha: true, webpSupported: false, role: "color" }).reencode, false);
+  assert.equal(planTextureEncode({ mimeType: "image/png", hasAlpha: false, webpSupported: true, role: "normal" }).reencode, false);
+});
+
+test("planTextureEncode moves opaque photographic JPEGs to WebP when the browser can", () => {
+  const plan = planTextureEncode({ mimeType: "image/jpeg", hasAlpha: false, webpSupported: true, role: "color" });
   assert.deepEqual(plan, { reencode: true, outputType: "image/webp", reason: "jpeg-to-webp" });
+});
+
+test("planTextureEncode keeps a data texture that was shipped as JPEG", () => {
+  // Re-encoding to PNG cannot restore what JPEG already threw away, and it
+  // only grows the file — so the bytes stay where they are.
+  const plan = planTextureEncode({ mimeType: "image/jpeg", hasAlpha: false, webpSupported: true, role: "normal" });
+  assert.deepEqual(plan, { reencode: false, outputType: "image/jpeg", reason: "lossless-optimal" });
 });
 
 /* ---------- browser texture strategy (fake canvas env) ---------- */
@@ -776,14 +1044,56 @@ test("the browser path downscales and re-encodes an oversized texture", async ()
   const texture = doc.createTexture("albedo").setImage(new Uint8Array([9, 9, 9])).setMimeType("image/png");
 
   const strategy = createCanvasTextureStrategy(fakeCanvasEnv({ width: 64, height: 64, pixels }));
-  const outcome = await strategy.resize(texture, { maxSize: 32 });
+  const outcome = await strategy.resize(texture, { maxSize: 32, role: "color" });
 
   assert.equal(outcome.changed, true);
+  assert.equal(outcome.role, "color");
   assert.equal(outcome.to.width, 32);
   assert.equal(outcome.to.height, 32);
-  assert.equal(outcome.to.mimeType, "image/webp", "opaque + WebP support → lossy WebP");
+  assert.equal(outcome.to.mimeType, "image/webp", "opaque colour + WebP support → lossy WebP");
   assert.equal(texture.getMimeType(), "image/webp");
   assert.equal(texture.getImage().byteLength, 64, "the fake encoder emitted 64 bytes");
+});
+
+test("the browser path re-encodes a downscaled normal map as PNG, never lossy", async () => {
+  const doc = new Document();
+  const pixels = rgba(64, 64, (x, y) => [x * 4, y * 4, 128, 255]);
+  const texture = doc.createTexture("normal").setImage(new Uint8Array([9, 9, 9])).setMimeType("image/png");
+
+  // WebP IS available here — the role must still win over the codec choice.
+  const strategy = createCanvasTextureStrategy(fakeCanvasEnv({ width: 64, height: 64, pixels }));
+  const outcome = await strategy.resize(texture, { maxSize: 32, role: "normal" });
+
+  assert.equal(outcome.changed, true);
+  assert.equal(outcome.to.mimeType, "image/png", "normal maps must stay lossless");
+  assert.equal(texture.getMimeType(), "image/png");
+});
+
+test("the browser path re-encodes a downscaled roughness/metallic map as PNG", async () => {
+  const doc = new Document();
+  const pixels = rgba(64, 64, (x, y) => [x * 4, y * 4, 128, 255]);
+  const texture = doc.createTexture("metallicRoughness").setImage(new Uint8Array([9, 9, 9])).setMimeType("image/png");
+
+  const strategy = createCanvasTextureStrategy(fakeCanvasEnv({ width: 64, height: 64, pixels }));
+  const outcome = await strategy.resize(texture, { maxSize: 32, role: "data" });
+
+  assert.equal(outcome.changed, true);
+  assert.equal(outcome.to.mimeType, "image/png", "material data must stay lossless");
+  assert.equal(texture.getMimeType(), "image/png");
+});
+
+test("the browser path never lossy-encodes an in-cap normal map either", async () => {
+  const doc = new Document();
+  const pixels = rgba(32, 32, (x, y) => [x * 8, y * 8, 128, 255]);
+  const original = new Uint8Array([9, 9, 9]);
+  const texture = doc.createTexture("normal").setImage(original).setMimeType("image/png");
+
+  const strategy = createCanvasTextureStrategy(fakeCanvasEnv({ width: 32, height: 32, pixels }));
+  const outcome = await strategy.resize(texture, { maxSize: 2048, role: "normal" });
+
+  assert.equal(outcome.changed, false);
+  assert.equal(outcome.reason, "lossless-optimal");
+  assert.equal(texture.getImage(), original, "the original bytes must survive");
 });
 
 test("the browser path picks the lossless PNG codec for alpha textures without WebP", async () => {
@@ -804,7 +1114,7 @@ test("the browser path falls back to JPEG for opaque textures without WebP", asy
   const texture = doc.createTexture("albedo").setImage(new Uint8Array([9, 9, 9])).setMimeType("image/png");
 
   const strategy = createCanvasTextureStrategy(fakeCanvasEnv({ width: 64, height: 64, pixels, webp: false }));
-  const outcome = await strategy.resize(texture, { maxSize: 32 });
+  const outcome = await strategy.resize(texture, { maxSize: 32, role: "color" });
   assert.equal(outcome.to.mimeType, "image/jpeg");
 });
 
@@ -814,7 +1124,7 @@ test("the browser path leaves an in-cap lossy texture untouched", async () => {
   const texture = doc.createTexture("albedo").setImage(new Uint8Array([9, 9, 9])).setMimeType("image/webp");
 
   const strategy = createCanvasTextureStrategy(fakeCanvasEnv({ width: 32, height: 32, pixels }));
-  const outcome = await strategy.resize(texture, { maxSize: 2048 });
+  const outcome = await strategy.resize(texture, { maxSize: 2048, role: "color" });
 
   assert.equal(outcome.changed, false);
   assert.equal(outcome.reason, "lossy-optimal");
@@ -830,7 +1140,7 @@ test("the browser path keeps the original bytes when re-encoding grows the file"
   // No downscale needed, but the fake encoder emits 512 bytes — bigger than
   // the original 3 — so the strategy must keep what the model shipped with.
   const strategy = createCanvasTextureStrategy(fakeCanvasEnv({ width: 32, height: 32, pixels, encodedBytes: 512 }));
-  const outcome = await strategy.resize(texture, { maxSize: 2048 });
+  const outcome = await strategy.resize(texture, { maxSize: 2048, role: "color" });
 
   assert.equal(outcome.changed, false);
   assert.equal(outcome.reason, "reencode-larger");

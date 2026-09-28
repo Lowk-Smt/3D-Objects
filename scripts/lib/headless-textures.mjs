@@ -23,13 +23,13 @@ import {
 } from './png-codec.mjs';
 
 /**
- * @returns {{ name: string, resize: (texture, { maxSize }) => Promise<object> }}
+ * @returns {{ name: string, resize: (texture, { maxSize, role }) => Promise<object> }}
  */
 export function createHeadlessTextureStrategy() {
   return {
     name: 'headless-png',
 
-    async resize(texture, { maxSize = 2048 } = {}) {
+    async resize(texture, { maxSize = 2048, role = 'data' } = {}) {
       const image = texture.getImage();
       if (!image) return { changed: false, reason: 'no-image' };
 
@@ -52,7 +52,7 @@ export function createHeadlessTextureStrategy() {
         return { changed: false, reason: 'within-cap' };
       }
 
-      const scaled = downscaleRgba(decoded.data, width, height, maxSize);
+      const scaled = downscaleRgba(decoded.data, width, height, maxSize, { renormalize: role === 'normal' });
       // Opaque images are encoded as RGB PNGs — 25% smaller than RGBA.
       const colorType = hasAlphaChannel(scaled.data) ? 6 : 2;
       const encoded = encodePng({ width: scaled.width, height: scaled.height, data: scaled.data, colorType });
@@ -66,6 +66,7 @@ export function createHeadlessTextureStrategy() {
       return {
         changed: true,
         reason: 'downscale',
+        role,
         from: { mimeType, width, height, bytes: image.byteLength },
         to: { mimeType, width: scaled.width, height: scaled.height, bytes: encoded.byteLength },
       };

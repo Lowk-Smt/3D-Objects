@@ -252,8 +252,12 @@ export function hasAlphaChannel(rgba) {
 /**
  * Bilinear downscale of straight RGBA8 so the longest edge fits maxSize.
  * Never upscales. Returns the new dimensions alongside the pixels.
+ *
+ * `renormalize` treats RGB as a tangent-space normal map (n = rgb/255*2-1),
+ * renormalizes every filtered vector and re-encodes it — plain averaging of
+ * normalized vectors shortens and biases them, which bends light wrongly.
  */
-export function downscaleRgba(rgba, width, height, maxSize) {
+export function downscaleRgba(rgba, width, height, maxSize, { renormalize = false } = {}) {
   const longest = Math.max(width, height);
   const scale = Math.min(1, maxSize / longest);
   const outWidth = Math.max(1, Math.round(width * scale));
@@ -281,5 +285,17 @@ export function downscaleRgba(rgba, width, height, maxSize) {
       }
     }
   }
+  if (renormalize) {
+    for (let i = 0; i < out.length; i += 4) {
+      const nx = (out[i] / 255) * 2 - 1;
+      const ny = (out[i + 1] / 255) * 2 - 1;
+      const nz = (out[i + 2] / 255) * 2 - 1;
+      const length = Math.hypot(nx, ny, nz) || 1;
+      out[i] = Math.round(((nx / length) * 0.5 + 0.5) * 255);
+      out[i + 1] = Math.round(((ny / length) * 0.5 + 0.5) * 255);
+      out[i + 2] = Math.round(((nz / length) * 0.5 + 0.5) * 255);
+    }
+  }
+
   return { width: outWidth, height: outHeight, data: out };
 }

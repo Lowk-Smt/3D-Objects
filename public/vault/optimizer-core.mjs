@@ -63,6 +63,84 @@ export const STAGE_ORDER = Object.freeze([
 
 export const CANCEL_MESSAGE = 'OPTIMIZE_CANCELLED';
 
+/**
+ * Texture roles. Only `color` (photographic) textures may ever take a lossy
+ * encoder; every other role carries material DATA and must stay lossless,
+ * because JPEG/WebP chroma subsampling and quantization silently corrupt it
+ * (normal maps bend light wrongly, packed roughness/metallic values drift,
+ * occlusion and mask thresholds shift).
+ */
+export const TEXTURE_ROLES = Object.freeze({ COLOR: 'color', NORMAL: 'normal', DATA: 'data' });
+
+/** The role assumed for anything we cannot prove is photographic. */
+export const DEFAULT_TEXTURE_ROLE = TEXTURE_ROLES.DATA;
+
+// The only material slots known to hold photographic imagery.
+const COLOR_SLOT_GETTERS = Object.freeze(['getBaseColorTexture', 'getEmissiveTexture']);
+
+function isMaterial(property) {
+  return Boolean(property)
+    && typeof property.getBaseColorTexture === 'function'
+    && typeof property.getNormalTexture === 'function';
+}
+
+/** Every texture slot the material exposes, whatever it is called. */
+function materialTextureGetters(material) {
+  return Object.getOwnPropertyNames(Object.getPrototypeOf(material))
+    .filter(name => /^get[A-Z]\w*Texture$/.test(name));
+}
+
+function referencesNormalSlot(texture) {
+  return texture.listParents().some(
+    parent => isMaterial(parent) && parent.getNormalTexture() === texture,
+  );
+}
+
+/**
+ * Classify every texture in the document by the role its material slot gives
+ * it, returning a Map<Texture, role>.
+ *
+ * Conservative by construction, in two ways:
+ *  - a texture is `color` only when a known photographic slot (base color,
+ *    emissive) references it. Every other slot — normal, packed
+ *    roughness/metallic, occlusion, masks — carries material DATA;
+ *  - if a texture is referenced by a colour slot AND any other slot, the
+ *    restrictive role wins, and any texture referenced only through a slot we
+ *    cannot enumerate (extension objects) is treated as DATA too.
+ */
+export function classifyTextures(document) {
+  const roles = new Map();
+  const dataTextures = new Set();
+
+  for (const material of document.getRoot().listMaterials()) {
+    for (const getter of materialTextureGetters(material)) {
+      const texture = material[getter]();
+      if (!texture) continue;
+      if (COLOR_SLOT_GETTERS.includes(getter)) {
+        if (!roles.has(texture)) roles.set(texture, TEXTURE_ROLES.COLOR);
+      } else {
+        dataTextures.add(texture);
+      }
+    }
+  }
+
+  // Restrictive role wins for dual-use textures.
+  for (const texture of dataTextures) {
+    roles.set(texture, referencesNormalSlot(texture) ? TEXTURE_ROLES.NORMAL : TEXTURE_ROLES.DATA);
+  }
+
+  // Anything a material points at that the slot scan could not see (extension
+  // objects) is material data until proven photographic.
+  for (const texture of document.getRoot().listTextures()) {
+    if (roles.has(texture)) continue;
+    if (texture.listParents().some(isMaterial)) {
+      roles.set(texture, referencesNormalSlot(texture) ? TEXTURE_ROLES.NORMAL : TEXTURE_ROLES.DATA);
+    }
+  }
+
+  return roles;
+}
+
 const GLB_MAGIC = 0x46546c67; // 'glTF'
 const CHUNK_TYPE_JSON = 0x4e4f534a; // 'JSON'
 
@@ -295,6 +373,7 @@ export async function optimizeDocument(document, options = {}) {
 
   if (resizeTexture && work.textureCount > 0) {
     report('Resizing textures…', 70);
+    const roles = classifyTextures(document);
     const limits = { maxSize: preset.textureSize, quality: preset.textureQuality };
     await timeStage('textures', async () => {
       const textures = document.getRoot().listTextures();
@@ -302,7 +381,10 @@ export async function optimizeDocument(document, options = {}) {
         // A single bad texture must never abort the whole optimization —
         // keep the original bytes for that texture and carry on.
         try {
-          await resizeTexture(textures[i], limits);
+          await resizeTexture(textures[i], {
+            ...limits,
+            role: roles.get(textures[i]) || DEFAULT_TEXTURE_ROLE,
+          });
         } catch (err) {
           console.warn('Texture resize skipped for one texture:', err);
         }

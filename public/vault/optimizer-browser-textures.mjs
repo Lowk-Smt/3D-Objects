@@ -21,9 +21,18 @@ const PNG_MIME = 'image/png';
 const JPEG_MIME = 'image/jpeg';
 const WEBP_MIME = 'image/webp';
 
-/** Which codec should carry this texture? Pure. */
-export function pickOutputFormat({ hasAlpha, webpSupported }) {
-  if (hasAlpha) return webpSupported ? WEBP_MIME : PNG_MIME;
+/**
+ * Which codec should carry this texture? Pure.
+ *
+ * Lossy encoders (JPEG, and WebP as browsers expose it through
+ * canvas.toBlob) are only ever chosen for photographic, opaque COLOUR data.
+ * Normal maps, packed roughness/metallic, occlusion, masks and every other
+ * material-DATA texture must stay lossless PNG — chroma subsampling and
+ * quantization silently corrupt them. Alpha gets the same treatment: lossy
+ * alpha encoding eats cutout edges.
+ */
+export function pickOutputFormat({ hasAlpha, webpSupported, role = 'data' }) {
+  if (role !== 'color' || hasAlpha) return PNG_MIME;
   return webpSupported ? WEBP_MIME : JPEG_MIME;
 }
 
@@ -37,22 +46,31 @@ export function planTextureEncode({
   hasAlpha = false,
   webpSupported = false,
   needsDownscale = false,
+  role = 'data',
 } = {}) {
   const normalized = String(mimeType || JPEG_MIME).toLowerCase();
+  // Anything that is not photographic, or that carries an alpha channel,
+  // may only be written losslessly.
+  const mustStayLossless = role !== 'color' || hasAlpha;
 
   if (needsDownscale) {
-    return { reencode: true, outputType: pickOutputFormat({ hasAlpha, webpSupported }), reason: 'downscale' };
+    return {
+      reencode: true,
+      outputType: pickOutputFormat({ hasAlpha, webpSupported, role }),
+      reason: 'downscale',
+    };
   }
 
-  if (hasAlpha) {
-    // Lossless territory: WebP (lossless) beats PNG; PNG is already optimal.
-    if (webpSupported && normalized !== WEBP_MIME) {
-      return { reencode: true, outputType: WEBP_MIME, reason: 'alpha-webp' };
+  if (mustStayLossless) {
+    // Already lossless PNG and within the cap: re-encoding buys nothing.
+    if (normalized === PNG_MIME) {
+      return { reencode: false, outputType: PNG_MIME, reason: 'lossless-optimal' };
     }
-    return { reencode: false, outputType: normalized, reason: 'alpha-lossless-optimal' };
+    // A data texture shipped as JPEG keeps its bytes: re-encoding to PNG
+    // cannot restore what JPEG already threw away, and only grows the file.
+    return { reencode: false, outputType: normalized, reason: 'lossless-optimal' };
   }
 
-  // Opaque: lossy always beats a photographic PNG.
   if (normalized === PNG_MIME) {
     return { reencode: true, outputType: webpSupported ? WEBP_MIME : JPEG_MIME, reason: 'png-to-lossy' };
   }
@@ -126,7 +144,7 @@ export function createCanvasTextureStrategy(env = {}) {
 
     supportsWebp,
 
-    async resize(texture, { maxSize = 2048, quality = 0.85 } = {}) {
+    async resize(texture, { maxSize = 2048, quality = 0.85, role = 'data' } = {}) {
       const image = texture.getImage();
       if (!image) return { changed: false, reason: 'no-image' };
 
@@ -143,10 +161,11 @@ export function createCanvasTextureStrategy(env = {}) {
           hasAlpha,
           webpSupported: await supportsWebp(),
           needsDownscale,
+          role,
         });
 
         if (!plan.reencode) {
-          return { changed: false, reason: plan.reason, outputType: plan.outputType };
+          return { changed: false, reason: plan.reason, role, outputType: plan.outputType };
         }
 
         const scale = needsDownscale ? maxSize / Math.max(width, height) : 1;
@@ -172,6 +191,7 @@ export function createCanvasTextureStrategy(env = {}) {
         return {
           changed: true,
           reason: plan.reason,
+          role,
           from: { mimeType, width, height, bytes: image.byteLength },
           to: { mimeType: plan.outputType, width: outWidth, height: outHeight, bytes: buffer.byteLength },
         };

@@ -333,6 +333,8 @@ scripts/
   lib/crate-fixture.mjs     # the crate generator itself
 tests/
   paths.test.mjs            # glTF path/MIME/download-name resolution
+  optimizer.test.mjs        # shipping optimizer core: validation, stages, roles, paths
+  optimizer-browser-textures.test.mjs  # real-canvas encoder checks (no lossy data)
   server-helpers.test.mjs   # server-side sanitizers, sniffers, wire format
   r2-storage.test.mjs       # R2 keys, validation, permissions, quota, rollback, errors
 ```
@@ -493,19 +495,29 @@ validate GLB → read → prune → dedup → simplify → textures → dedup �
 - **Adaptive stages.** Each stage is skipped when the document has no work
   for it: no mesh primitives → no simplify (MeshoptSimplifier has nothing to
   do and would throw on an empty document), no textures → no texture pass.
-- **Dual-path textures.** The core never touches pixels itself — it calls an
-  injected strategy. The browser half (`optimizer-browser-textures.mjs`)
-  decodes with `createImageBitmap`, scans the decoded pixels for a real alpha
-  channel, probes WebP support once, and then picks a codec per texture:
-  alpha → lossless (WebP, else PNG); opaque → lossy (WebP, else JPEG),
-  because a lossless PNG of an opaque photo is usually several times larger
-  than a quality JPEG. Textures within the preset cap are left alone unless a
-  strictly better codec exists, and a re-encode that would *grow* the bytes
-  is discarded — per texture, not just per file. The headless half
-  (`scripts/lib/headless-textures.mjs`) is a dependency-free pure-JS PNG
-  path (zlib inflate → unfilter → bilinear downscale → re-encode, dropping
-  the alpha channel when the result is opaque) used by the tests and the
-  benchmark; non-PNG or unsupported PNGs are passed through untouched.
+- **Dual-path textures, role-aware.** The core never touches pixels itself —
+  it calls an injected strategy. Before touching a single texture it
+  classifies every one by the material slot that references it
+  (`classifyTextures()`): only `baseColor`/`emissive` are photographic
+  **colour**; `normal` maps get their own role; packed
+  `metallicRoughness`, `occlusion`, masks and anything referenced through a
+  slot we cannot enumerate (including extensions) are material **data**.
+  Lossy encoders are then only ever chosen for opaque photographic colour.
+  Normal maps, roughness/metallic, occlusion and alpha cutouts are written
+  losslessly (PNG), because JPEG/WebP chroma subsampling and quantization
+  silently corrupt material data — and a texture used by both a colour and a
+  data slot takes the restrictive role.
+  - *Browser half* (`optimizer-browser-textures.mjs`): `createImageBitmap`
+    decode → per-texture alpha scan → one-time WebP probe → codec choice →
+    canvas downscale. Textures within the preset cap are left alone unless a
+    strictly better codec exists, and a re-encode that would *grow* the bytes
+    is discarded — per texture, not just per file.
+  - *Headless half* (`scripts/lib/headless-textures.mjs`): a dependency-free
+    pure-JS PNG path (zlib inflate → unfilter → bilinear downscale →
+    re-encode, dropping the alpha channel when the result is opaque) used by
+    the tests and the benchmark. Normal maps are renormalized after
+    filtering, because averaging normalized vectors shortens and biases them.
+    Non-PNG or unsupported PNGs are passed through untouched.
 
 Presets (ratio = target triangle ratio, error = simplifier error bound):
 
@@ -737,6 +749,12 @@ npm run test:e2e -- --phase=2
   actually doing their jobs, cancellation, a throwing texture strategy never
   aborting the run, the never-bigger rule, and both texture paths (browser
   encoder decisions + the headless PNG path).
+- `tests/optimizer-browser-textures.test.mjs` runs the shipping browser
+  texture strategy against a REAL canvas implementation (real image decode,
+  real 2D downscale, real PNG/WebP/JPEG encoders) and asserts with real bytes
+  that normal/roughness/metallic/occlusion textures are written as PNG and
+  never lossily, that photographic colour still gets the WebP win, and that
+  real alpha pixels force the lossless path.
 - `tests/server-helpers.test.mjs` covers the server-side sanitizers,
   path-traversal neutralization, id validation, image sniffing and data-URL
   validation, and asserts the client and server MIME tables stay identical.
