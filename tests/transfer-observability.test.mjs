@@ -132,11 +132,40 @@ test("reported URLs are redacted — signed query strings never reach diagnostic
   // The one-line console summary prints host/status but never a URL…
   const rtStart = source.indexOf("function reportTransfer(");
   const rtBody = source.slice(rtStart, source.indexOf("\n}", rtStart) + 3);
-  assert.ok(!rtBody.includes("details.url"), "reportTransfer must not print the URL inline");
-  assert.match(rtBody, /host=\$\{details\.host/);
+  // The one-line console summary prints host/status but never a URL: check
+  // the console.info arguments themselves (comments may discuss details.url;
+  // the printed template may not).
+  const infoAt = rtBody.indexOf("console.info(");
+  const infoArgs = rtBody.slice(infoAt, rtBody.indexOf(", details,", infoAt));
+  assert.ok(infoArgs.length > 0, "console.info summary line must exist");
+  assert.ok(!infoArgs.includes("details.url"), "reportTransfer must not print the URL inline");
+  assert.match(infoArgs, /host=\$\{details\.host/);
   // …and the probe echoes redacted targets only.
   assert.match(source, /console\.warn\('\[perf:transfer\] probe: no presigned URL for', redactUrl\(target\)/);
   assert.match(source, /hostOf\(url\) \|\| redactUrl\(url\)/);
+
+  // Defense in depth: redaction is RE-APPLIED after `extra` is merged, so an
+  // extra.url (from any caller) can never smuggle a signed URL into
+  // diagnostics. The full signed URL may only feed findResourceTiming.
+  const assignAt = rtBody.indexOf("Object.assign({");
+  const reRedactAt = rtBody.indexOf("details.url = redactUrl(details.url || url || '')");
+  const timingLookupAt = rtBody.indexOf("findResourceTiming(url,");
+  assert.ok(assignAt !== -1 && reRedactAt !== -1, "details.url must be re-redacted after the extra merge");
+  assert.ok(assignAt < reRedactAt, "re-redaction must happen AFTER Object.assign(..., extra)");
+  assert.ok(timingLookupAt !== -1 && timingLookupAt < reRedactAt,
+    "resource-timing matching keeps the full URL; it is not affected by the re-redaction");
+});
+
+test("probe cache guidance never treats small bytes as cache evidence", () => {
+  // bytes is the decoded Blob size — identical for cached and network
+  // responses of the same object — so the old "tiny byte count suggests a
+  // cache hit" claim was wrong and must stay gone.
+  assert.doesNotMatch(source, /tiny bytes? suggests a cache hit/);
+  assert.doesNotMatch(source, /tiny byte count/);
+  // The corrected explanation points at the real evidence and its limits.
+  assert.match(source, /resourceTiming\.fromCache/);
+  assert.match(source, /NOT cache evidence/);
+  assert.match(source, /fromCache: null/);
 });
 
 test("transfer-stats.js stays pure: no imports, no network, no DOM", () => {

@@ -720,10 +720,17 @@ await __vaultTransferProbe("<file-id>", 3)   // or an absolute URL
 ```
 
 It re-fetches one resource N times and prints a table of per-attempt
-status, host, bytes, duration, throughput and cache headers. Near-identical
-attempts with a tiny byte count suggest a cache hit; wildly varying
-attempts suggest congestion or throttling on the network path rather than
-the application.
+status, host, bytes, duration, throughput and cache headers. Note that
+`bytes` is the decoded Blob size — it reflects the full object whether it
+came from a cache or the network, so a small byte count is **not** cache
+evidence. Cache evidence lives in each attempt's
+`resourceTiming.fromCache` / `transferSize` (from
+PerformanceResourceTiming): `fromCache: true` means the response came
+from a cache, but cross-origin responses without a `Timing-Allow-Origin`
+header have those fields withheld, leaving cache status unknown
+(`fromCache: null`) — treat it as "unknown", not "no". Wildly varying
+durations across attempts suggest congestion or throttling on the network
+path rather than the application.
 
 ## Limitations
 

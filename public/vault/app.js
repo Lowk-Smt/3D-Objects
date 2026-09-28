@@ -289,6 +289,12 @@ function reportTransfer(kind, name, url, getHeader, status, bytes, startedAt, ex
         return rt ? describeResourceTiming(rt) : null;
       })(),
     }, extra || {});
+    // Defense in depth: `extra` (or a future caller) must never be able to
+    // smuggle a signed URL into diagnostics. Re-apply redaction AFTER the
+    // merge so details.url is redacted no matter where it came from. The
+    // full signed URL was used above ONLY for the findResourceTiming
+    // lookup; it never reaches console output.
+    details.url = redactUrl(details.url || url || '');
     console.info(
       `[perf:transfer] ${kind} ${name}: ${formatBytes(bytes)} in ${ms}ms`
         + (mbps ? ` (~${mbps} Mbps)` : '')
@@ -570,8 +576,13 @@ if (typeof window !== 'undefined'){
     })));
     console.info('[perf:transfer] probe details:', rows);
     console.info('[perf:transfer] probe of', hostOf(url) || redactUrl(url),
-      '— near-identical ms across attempts with tiny bytes suggests a cache hit;'
-      + ' wildly different attempts suggest congestion/throttling on the path.');
+      '— bytes is the decoded Blob size, NOT cache evidence (it reflects the'
+      + ' full object either way). Cache evidence lives in each row\'s'
+      + ' resourceTiming.fromCache / transferSize when the browser exposes'
+      + ' PerformanceResourceTiming body sizes; cross-origin responses without'
+      + ' Timing-Allow-Origin leave cache status unknown (fromCache: null).'
+      + ' Wildly different durations across attempts suggest congestion or'
+      + ' throttling on the network path, not the application.');
     return rows;
   };
 }
