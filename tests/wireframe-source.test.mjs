@@ -227,7 +227,8 @@ test('worker termination clears pending tasks and invalidates stale results', ()
   const onMessage = fnBody(source, 'function onWireframeWorkerMessage(');
   assert.match(onMessage, /const task = wireframePending\.get\(message\.id\);/);
   assert.match(onMessage, /if \(!task\) return;/, 'a stale result must be ignored');
-  assert.match(onMessage, /if \(task\.token !== previewToken\) return;/, 'a result for a replaced model must be ignored');
+  assert.match(onMessage, /if \(task\.token !== previewToken\)\{/, 'a result for a replaced model must be ignored');
+  assert.match(onMessage, /settleWireframeTask\(task\); \/\/ the model switched while in flight/);
 
   const clear = fnBody(source, 'function clearModel()');
   assert.match(clear, /terminateWireframeWorker\(\);/, 'model switch/clear must terminate the worker');
@@ -251,15 +252,62 @@ test('worker communication failures fall back to synchronous edges', () => {
   assert.match(prepare, /prepareWireframeEdgesSync\(obj\)/);
   assert.match(prepare, /Wireframe worker postMessage failed/);
   assert.match(prepare, /const token = previewToken;/);
-  assert.match(prepare, /if \(token !== previewToken \|\| current !== root\) return;/);
+  assert.match(prepare, /if \(token !== previewToken \|\| current !== root\)\{/);
+  assert.match(prepare, /totalTimer\.end\('superseded'\)/);
 });
 
 // ---------------------------------------------------------------------------
 // Performance instrumentation
 // ---------------------------------------------------------------------------
 
+test('preparation timing measures real completion, not queue time', () => {
+  const body = fnBody(source, 'async function prepareWireframe(');
+
+  // The reported preparation duration starts before anything is queued...
+  const prepareTimerAt = body.indexOf('const totalTimer = perf.time(`wireframe:prepare:${currentModelName');
+  assert.notEqual(prepareTimerAt, -1, 'preparation timer must exist');
+  assert.ok(prepareTimerAt < body.indexOf('await wireframeWorkerUrlPromise'), 'timer starts at preparation start');
+
+  // ...and ends only after every queued task has resolved.
+  const awaitAt = body.indexOf('await Promise.all(completions)');
+  const endAt = body.lastIndexOf('totalTimer.end(');
+  assert.notEqual(awaitAt, -1, 'preparation must await all task completions');
+  assert.notEqual(endAt, -1, 'preparation timer must be ended');
+  assert.ok(endAt > awaitAt, 'the preparation timer must end only after all tasks have actually completed');
+  assert.match(body.slice(endAt), /totalTimer\.end\(`?\$\{completions\.length\} resolved`?\)/);
+
+  // Queue/setup time is reported separately and must not be labelled as total.
+  assert.match(body, /perf\.time\(`wireframe:queue:\$\{currentModelName/);
+  assert.ok(
+    body.indexOf('queueTimer.end(') < awaitAt,
+    'the queue timer is the one that ends at queue time'
+  );
+
+  // Every terminal path settles its completion signal, so the await cannot hang.
+  const completion = fnBody(source, 'function wireframeCompletion(');
+  assert.match(completion, /settle\(\)\{/);
+  assert.match(completion, /if \(done\) return;/);
+  const terminate = fnBody(source, 'function terminateWireframeWorker(');
+  assert.match(terminate, /for \(const task of wireframePending\.values\(\)\) settleWireframeTask\(task\);/);
+  const onMessage = fnBody(source, 'function onWireframeWorkerMessage(');
+  assert.equal((onMessage.match(/settleWireframeTask\(task\)/g) || []).length, 3, 'all three outcomes settle');
+});
+
+test('no dangling wireframe capability identifier in the viewer', () => {
+  // Guard for a real regression: setWireframeMode used to reference a
+  // capability flag that had been removed, which threw at toggle time.
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '');
+  assert.ok(
+    !/wireframeWorkerSupported/.test(code),
+    'setWireframeMode must not gate on a worker-capability flag; reachability is decided in getWireframeWorker()'
+  );
+});
+
 test('wireframe instrumentation reports preparation, both clicks, and both render modes', () => {
   assert.match(source, /perf\.time\(`wireframe:prepare:\$\{currentModelName/);
+  assert.match(source, /perf\.time\(`wireframe:queue:\$\{currentModelName/);
   assert.match(source, /perf\.time\(`wireframe:prepare-sync:\$\{currentModelName/);
   assert.match(source, /perf\.time\(wireframeOn \? 'wireframe:click-on' : 'wireframe:click-off'\)/);
   assert.match(source, /const renderMode = wireframeOn \? 'wireframe' : 'normal';/);

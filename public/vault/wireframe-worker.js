@@ -6,7 +6,7 @@
    posts back a transferable Float32Array of XYZ segment pairs.
 
    Packing happens on the main thread (see buildWorkerPayload in
-   ./wireframe.js), so the worker has exactly one input shape and its inner
+   ./wireframe.js), so the worker has a single input shape and its inner
    loop never has to touch a stride, an offset or a normalized value.
 
    Message protocol

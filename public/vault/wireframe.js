@@ -5,18 +5,20 @@
    wireframe overlay draw". It is loaded in three places:
 
      1. public/vault/wireframe-worker.js  — a real Web Worker that runs it
-        off the main thread so large models never freeze the UI.
-     2. public/vault/app.js               — the synchronous fallback path,
-        used only when Workers are unavailable or worker messaging fails.
+        off the main thread, so crease detection no longer blocks the UI.
+     2. public/vault/app.js               — the EMERGENCY synchronous fallback,
+        used only when Workers are unavailable or worker messaging fails. It
+        runs on the main thread and blocks for as long as it takes.
      3. tests/wireframe-edges.test.mjs    — A/B compared against the REAL
-        THREE.EdgesGeometry from the exact installed three@0.169.0.
+        THREE.EdgesGeometry from the installed three@0.169.0.
 
    It must therefore stay dependency-free and environment-neutral: no DOM,
    no `window`, no three.js import. Everything is plain ArrayBuffer /
    typed-array math, ES2017 syntax only.
 
-   The algorithm reproduces THREE.EdgesGeometry(geometry, thresholdAngle)
-   exactly (three r169):
+   The algorithm matches THREE.EdgesGeometry@0.169.0 (geometry, thresholdAngle),
+   validated by the direct output-equivalence tests in
+   tests/wireframe-edges.test.mjs. What it mirrors from three r169:
 
      - triangles are walked 3 vertices at a time (indexed via the index
        attribute, otherwise sequentially);
@@ -33,10 +35,10 @@
      - edges that never find a sibling (boundary edges) are emitted at the
        very end using their stored original vertex indices.
 
-   The output is a flat Float32Array of XYZ pairs — exactly the buffer
-   THREE.EdgesGeometry puts on its `position` attribute — so a LineSegments
-   built from it looks pixel-identical to the old synchronous code while
-   being produced without blocking the main thread.
+   The output is a flat Float32Array of XYZ pairs, the same shape
+   THREE.EdgesGeometry puts on its `position` attribute, so a LineSegments built
+   from it renders the same CAD-like overlay while being produced without
+   blocking the main thread.
    ============================================================ */
 
 export const DEFAULT_THRESHOLD_ANGLE = 25;
@@ -126,8 +128,7 @@ export function readVertex(attr, index) {
  * descriptor instead (it only ever sees typed arrays), so the count is derived
  * from the array length and the stride when it is absent. Getting this wrong
  * silently produces an EMPTY wireframe for every non-indexed geometry, which
- * is exactly why tests/wireframe-edges.test.mjs drives the worker payload end
- * to end.
+ * is why tests/wireframe-edges.test.mjs drives the worker payload end to end.
  */
 export function positionCount(attr) {
   if (!attr || !attr.array) return 0;
@@ -224,7 +225,7 @@ export function extractWireframeEdges(geometry, thresholdAngle = DEFAULT_THRESHO
     const h1 = hashVertex(b);
     const h2 = hashVertex(c);
 
-    // Skip degenerate triangles exactly like three.js does.
+    // Skip degenerate triangles the same way three.js does.
     if (h0 === h1 || h1 === h2 || h2 === h0) continue;
 
     const indexArr = [i0, i1, i2];

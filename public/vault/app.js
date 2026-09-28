@@ -2182,10 +2182,11 @@ $('resetBtn').addEventListener('click', () => { if (current) frameCamera(current
    attaches/detaches the cached line, so ON -> OFF -> ON never recomputes
    anything on the main thread.
 
-   The worker runs the exact same algorithm as the synchronous fallback
-   (both call extractWireframeEdges in ./wireframe.js), which the test-suite
-   A/B compares against the real THREE.EdgesGeometry(geometry, 25) — the
-   CAD-like appearance is therefore preserved bit for bit.
+   The worker runs the same shared algorithm as the synchronous fallback
+   (both call extractWireframeEdges in ./wireframe.js). Its output matches
+   THREE.EdgesGeometry@0.169.0 at the 25 degree threshold, validated by direct
+   output-equivalence tests in tests/wireframe-edges.test.mjs, so the CAD-like
+   appearance is preserved.
 
    Worker failures are always recoverable: any error drops every pending
    task, and a later preparation builds a fresh worker.
@@ -2193,8 +2194,16 @@ $('resetBtn').addEventListener('click', () => { if (current) frameCamera(current
 
 const WIREFRAME_MODULE_URL = new URL('./wireframe.js', import.meta.url).href;
 
-/** The Blob URL this worker is constructed from; revoked when it is replaced
-    or the page goes away. */
+/**
+ * The Blob URL the worker is constructed from.
+ *
+ * LIFETIME (by design, kept deliberately simple): exactly one blob URL is
+ * created per page — lazily, the first time a model is prepared — and it is
+ * reused for EVERY worker this page constructs, including a replacement worker
+ * built after a failure. It is revoked on `pagehide`, and immediately before a
+ * replacement URL is created (which currently only happens if this code runs
+ * again after a revoke). So it is not one URL per worker.
+ */
 let wireframeWorkerBlobUrl = null;
 
 /** The live worker, or null when none is running (created lazily). */
@@ -2206,12 +2215,16 @@ const wireframePending = new Map();
 
 /**
  * Resolves to the worker URL, or null when this browser cannot run a worker at
- * all (the synchronous fallback then owns the feature).
+ * all (the emergency synchronous fallback then owns the feature).
  *
  * The worker is shipped as a Blob URL so the app stays a plain static module
  * with no bundler step. A module worker built from `blob:` has no meaningful
  * base URL, so its static import of ./wireframe.js is rewritten to the
  * absolute URL the module is actually served from.
+ *
+ * The URL outlives any single worker: see the lifetime note on
+ * `wireframeWorkerBlobUrl`. It is created once per page here and released by
+ * revokeWireframeWorkerBlobUrl() on `pagehide` (or before being replaced).
  */
 const wireframeWorkerUrlPromise = (async () => {
   if (typeof Worker === 'undefined' || typeof Blob === 'undefined'
@@ -2267,17 +2280,45 @@ function getWireframeWorker(url){
 }
 
 /**
+ * Idempotent one-shot completion signal for a queued wireframe task.
+ *
+ * Resolved when the task reaches a terminal state — worker result, worker
+ * failure, cancellation/teardown, or emergency synchronous fallback. This is
+ * what lets the preparation timer measure real elapsed preparation time
+ * instead of queue time.
+ */
+function wireframeCompletion(){
+  let done = false;
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return {
+    promise,
+    settle(){
+      if (done) return;
+      done = true;
+      resolve();
+    }
+  };
+}
+
+function settleWireframeTask(task){
+  if (task && task.completion) task.completion.settle();
+}
+
+/**
  * Drop the worker and every in-flight task.
  *
  * Clearing `wireframePending` is what invalidates stale results: a result that
  * arrives afterwards finds no task and is ignored, so it can never touch the
- * model that replaced the one it was computed for.
+ * model that replaced the one it was computed for. Pending tasks are settled
+ * first so a preparation awaiting them can never hang.
  */
 function terminateWireframeWorker(){
   if (wireframeWorker){
     try { wireframeWorker.terminate(); } catch { /* already gone */ }
     wireframeWorker = null;
   }
+  for (const task of wireframePending.values()) settleWireframeTask(task);
   wireframePending.clear();
 }
 
@@ -2288,17 +2329,22 @@ function onWireframeWorkerMessage(event){
   const task = wireframePending.get(message.id);
   if (!task) return; // cancelled or superseded — drop the stale result
   wireframePending.delete(message.id);
-  if (task.token !== previewToken) return; // the model switched while in flight
+  if (task.token !== previewToken){
+    settleWireframeTask(task); // the model switched while in flight
+    return;
+  }
 
   if (message.type !== 'result' || !message.positions){
     console.warn('Wireframe worker failed for one mesh; building its edges synchronously:', message.message);
     prepareWireframeEdgesSync(task.mesh);
+    settleWireframeTask(task);
     return;
   }
 
   setWireframeLine(task.mesh, edgeGeometryFromPositions(message.positions));
   if (wireframeOn) applyWireframe(task.mesh);
   needsRender = true;
+  settleWireframeTask(task);
 }
 
 /** LineSegments geometry from a flat XYZ buffer produced by the worker. */
@@ -2317,6 +2363,9 @@ function edgeGeometryFromPositions(positions){
 function onWireframeWorkerError(event){
   console.warn('Wireframe worker failed; falling back to synchronous edges', event && event.message);
   const orphaned = Array.from(wireframePending.values());
+  // terminate() settles these tasks; the fallback below still runs before the
+  // awaiting preparation continues, so the reported preparation duration
+  // includes the emergency synchronous work.
   terminateWireframeWorker();
   for (const task of orphaned){
     if (task.token === previewToken && task.mesh) prepareWireframeEdgesSync(task.mesh);
@@ -2366,12 +2415,20 @@ function disposeWireframeCache(root){
 }
 
 /**
- * Synchronous fallback — reached only when Workers are unavailable or worker
- * messaging genuinely failed. This is the only place EdgesGeometry is still
- * constructed, and it keeps identical 25-degree crease behaviour.
+ * EMERGENCY synchronous fallback — reached only when Workers are unavailable or
+ * worker messaging genuinely failed.
+ *
+ * This is the only place EdgesGeometry is still constructed. It runs on the
+ * main thread and therefore DOES block rendering for as long as the extraction
+ * takes — the very freeze this feature removes. It exists so the overlay still
+ * works without a worker, and its output matches THREE.EdgesGeometry@0.169.0 at
+ * the 25 degree threshold (validated by tests/wireframe-edges.test.mjs).
  */
 function prepareWireframeEdgesSync(mesh){
   if (!mesh || !mesh.geometry || mesh.userData._wireframeReady) return;
+  // Nothing sensible to crease-detect without a position attribute; three.js
+  // would throw. Models without one keep the shaded look only.
+  if (!mesh.geometry.getAttribute || !mesh.geometry.getAttribute('position')) return;
   const timer = perf.time(`wireframe:prepare-sync:${currentModelName || 'model'}`);
   try {
     // The EdgesGeometry is only a source of positions here; the cached
@@ -2397,27 +2454,42 @@ function prepareWireframeEdgesSync(mesh){
 async function prepareWireframe(root){
   if (!root) return;
   const token = previewToken;
-  const url = await wireframeWorkerUrlPromise;
-  if (token !== previewToken || current !== root) return; // superseded while awaiting
 
-  if (!url){
-    root.traverse(obj => { if (obj.isMesh && obj.geometry) prepareWireframeEdgesSync(obj); });
+  // "Preparation duration" is measured from here until EVERY mesh wireframe for
+  // this model has been resolved — worker result, worker failure, or emergency
+  // synchronous fallback. It is deliberately NOT the time spent queueing jobs.
+  const totalTimer = perf.time(`wireframe:prepare:${currentModelName || 'model'}`);
+
+  const url = await wireframeWorkerUrlPromise;
+  if (token !== previewToken || current !== root){
+    totalTimer.end('superseded');
     return;
   }
 
-  const timer = perf.time(`wireframe:prepare:${currentModelName || 'model'}`);
-  let meshes = 0;
+  if (!url){
+    // No Worker support at all: the emergency synchronous path runs here and
+    // DOES block the main thread for as long as it takes — which is exactly why
+    // it is only reached when a worker is genuinely unavailable.
+    root.traverse(obj => { if (obj.isMesh && obj.geometry) prepareWireframeEdgesSync(obj); });
+    totalTimer.end('synchronous fallback');
+    return;
+  }
+
+  const completions = [];
+  const queueTimer = perf.time(`wireframe:queue:${currentModelName || 'model'}`);
   root.traverse(obj => {
     if (!obj.isMesh || !obj.geometry || obj.userData._wireframeReady) return;
     const id = ++wireframeTaskSeq;
     const { message, transfer } = buildWorkerPayload(obj.geometry, id);
-    wireframePending.set(id, { mesh: obj, token });
-    meshes++;
+    const completion = wireframeCompletion();
+    completions.push(completion.promise);
+    wireframePending.set(id, { mesh: obj, token, completion });
     try {
       const worker = getWireframeWorker(url);
       if (!worker){
         wireframePending.delete(id);
         prepareWireframeEdgesSync(obj);
+        completion.settle();
         return;
       }
       worker.postMessage(message, transfer);
@@ -2425,9 +2497,18 @@ async function prepareWireframe(root){
       wireframePending.delete(id);
       console.warn('Wireframe worker postMessage failed; using synchronous edges', err);
       prepareWireframeEdgesSync(obj);
+      completion.settle();
     }
   });
-  timer.end(`${meshes} mesh${meshes === 1 ? '' : 'es'} queued`);
+  queueTimer.end(`${completions.length} mesh${completions.length === 1 ? '' : 'es'} queued`);
+
+  if (!completions.length){
+    totalTimer.end('nothing to prepare');
+    return;
+  }
+
+  await Promise.all(completions);
+  totalTimer.end(`${completions.length} resolved`);
 }
 
 
@@ -2452,10 +2533,14 @@ function detachWireframe(obj){
 /**
  * Toggle the wireframe overlay.
  *
- * Worker-capable browsers never build edges synchronously here — the edges
- * were prepared at load time (prepareWireframe). If a mesh's wireframe is
- * still pending, the main thread keeps rendering the normal shaded model
- * until the worker result arrives.
+ * This function never builds edge geometry. All edge work already happened when
+ * the model loaded (prepareWireframe): either off the main thread in the
+ * worker, or — only when a worker was genuinely unavailable or failed — in the
+ * emergency synchronous fallback, which does block the main thread for as long
+ * as it takes (that work is triggered from the load path, never from here).
+ *
+ * A mesh with no cached line yet is simply still being prepared: the shaded
+ * model keeps rendering and the line attaches itself when the result arrives.
  */
 function setWireframeMode(enabled){
   if (!current) return;
@@ -2463,12 +2548,6 @@ function setWireframeMode(enabled){
     if (!obj.isMesh) return;
     if (enabled){
       if (obj.userData._wireLine) applyWireframe(obj);
-      else if (wireframeWorkerSupported){
-        // Worker path: preparation is (or will be) in flight. Show the shaded
-        // model until it lands — nothing synchronous happens on this thread.
-      } else {
-        prepareWireframeEdgesSync(obj);
-      }
     } else {
       detachWireframe(obj);
     }
