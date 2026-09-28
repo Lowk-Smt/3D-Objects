@@ -253,18 +253,30 @@ function fakeCanvasEnv({ width, height, pixels, webp = true, encodedBytes = 64 }
 /* ---------- browser / Node parity ---------- */
 
 test("the installed glTF-Transform matches the version the browser loads", () => {
-  // The import map in src/app/page.tsx pins the exact version the browser
-  // uses; the devDependency must match, or these assertions could pass
-  // while the real optimizer behaves differently.
+  // The import map shared by the page and browser regression test pins the
+  // exact CDN versions; devDependencies must match those browser modules.
   const installed = JSON.parse(
     fs.readFileSync(new URL("../node_modules/@gltf-transform/core/package.json", import.meta.url), "utf8"),
   ).version;
-  const page = fs.readFileSync(new URL("../src/app/page.tsx", import.meta.url), "utf8");
+  const importMap = JSON.parse(fs.readFileSync(new URL("../src/lib/vault-import-map.json", import.meta.url), "utf8"));
   assert.ok(
-    page.includes(`@gltf-transform/core@${installed}`),
-    `src/app/page.tsx does not pin @gltf-transform/core@${installed}`,
+    importMap.imports["@gltf-transform/core"].includes(`@gltf-transform/core@${installed}`),
+    `src/lib/vault-import-map.json does not pin @gltf-transform/core@${installed}`,
   );
-  assert.ok(page.includes(`@gltf-transform/functions@${installed}`), "functions version drifted");
+  assert.ok(
+    importMap.imports["@gltf-transform/functions"].includes(`@gltf-transform/functions@${installed}`),
+    "functions version drifted",
+  );
+});
+
+test("the browser import map forces glTF-Transform functions and extensions onto one core URL", () => {
+  const importMap = JSON.parse(fs.readFileSync(new URL("../src/lib/vault-import-map.json", import.meta.url), "utf8"));
+  assert.match(importMap.imports["@gltf-transform/core"], /@gltf-transform\/core@4\.5\.0\?target=es2022$/);
+  assert.match(importMap.imports["@gltf-transform/functions"], /\?external=@gltf-transform\/core$/);
+
+  const app = fs.readFileSync(new URL("../public/vault/app.js", import.meta.url), "utf8");
+  assert.match(app, /from ['"]\.\/optimizer-upload\.mjs['"]/);
+  assert.doesNotMatch(app, /from ['"]@gltf-transform\/(?:core|functions)['"]/);
 });
 
 test("the installed meshoptimizer matches the version the browser loads", () => {
@@ -273,10 +285,10 @@ test("the installed meshoptimizer matches the version the browser loads", () => 
   const installed = JSON.parse(
     fs.readFileSync(new URL("../node_modules/meshoptimizer/package.json", import.meta.url), "utf8"),
   ).version;
-  const page = fs.readFileSync(new URL("../src/app/page.tsx", import.meta.url), "utf8");
+  const importMap = JSON.parse(fs.readFileSync(new URL("../src/lib/vault-import-map.json", import.meta.url), "utf8"));
   assert.ok(
-    page.includes(`meshoptimizer@${installed}`),
-    `src/app/page.tsx does not pin meshoptimizer@${installed}`,
+    importMap.imports.meshoptimizer.includes(`meshoptimizer@${installed}`),
+    `src/lib/vault-import-map.json does not pin meshoptimizer@${installed}`,
   );
 });
 

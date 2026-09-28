@@ -34,13 +34,11 @@ import {
   DEFAULT_THRESHOLD_ANGLE, WORKER_FILE_URL, buildWorkerPayload
 } from './wireframe.js';
 
-/* ---- optimization pipeline: the validated, adaptive core is shared verbatim
-       with tests/optimizer.test.mjs and scripts/benchmark-optimizer.mjs; the
-       browser-only halves (canvas texture path, Blob I/O) live beside it ---- */
+/* ---- browser optimizer upload entry: shares the exact production CDN
+       dependency graph with the browser regression test. ---- */
 import {
-  CANCEL_MESSAGE, optimizeGlbBytes, resolvePreset, shouldUseOptimized,
-} from './optimizer-core.mjs';
-import { createCanvasTextureStrategy } from './optimizer-browser-textures.mjs';
+  CANCEL_MESSAGE, optimizeGLBBlob, resolvePreset, shouldUseOptimized,
+} from './optimizer-upload.mjs';
 
 /* ============================================================
    Model Vault — shared multi-user library frontend.
@@ -600,35 +598,19 @@ if (typeof window !== 'undefined'){
                   → prune → metadata → write
 
    Stages are adaptive (no meshes → no simplify, no textures → no texture
-   pass) and textures take the dual-path treatment: this file supplies the
-   browser half (canvas decode, per-texture alpha scan, WebP/JPEG/PNG
+   pass) and textures take the dual-path treatment: the upload entry supplies
+   the browser half (canvas decode, per-texture alpha scan, WebP/JPEG/PNG
    encoder choice — optimizer-browser-textures.mjs); the headless half is
    the dependency-free pure-JS PNG path used by the benchmark.
    ============================================================ */
 
-// One strategy per page: it probes WebP support lazily, once.
-const canvasTextureStrategy = createCanvasTextureStrategy();
-
-async function optimizeGLBBlob(blob, onProgress, presetKey = 'balanced', cancelToken = null){
+async function optimizeSelectedUpload(blob, onProgress, presetKey = 'balanced', cancelToken = null){
   const totalTimer = perf.time(`optimize:${resolvePreset(presetKey).key}`);
   try {
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-
-    // The core validates the GLB container before parsing, so a foreign or
-    // corrupt file fails here with an actionable message instead of a
-    // cryptic parser error halfway through the pipeline.
-    const { glb } = await optimizeGlbBytes(bytes, {
-      preset: presetKey,
-      resizeTexture: (texture, limits) => canvasTextureStrategy.resize(texture, limits),
-      timeStage: (label, run) => {
-        const stageTimer = perf.time(`optimize:${label}`);
-        return run().finally(() => stageTimer.end());
-      },
-      onProgress,
-      shouldCancel: () => Boolean(cancelToken && cancelToken.cancelled),
+    const outBlob = await optimizeGLBBlob(blob, onProgress, presetKey, cancelToken, (label, run) => {
+      const stageTimer = perf.time(`optimize:${label}`);
+      return run().finally(() => stageTimer.end());
     });
-
-    const outBlob = new Blob([glb], { type: 'model/gltf-binary' });
     totalTimer.end(`${fmtSize(blob.size)} → ${fmtSize(outBlob.size)}`);
     return outBlob;
   } catch (err){
@@ -685,7 +667,7 @@ function askToOptimize(file){
       const presetKey = presetSelect.value;
 
       try {
-        const optimizedBlob = await optimizeGLBBlob(file, (step, pct) => {
+        const optimizedBlob = await optimizeSelectedUpload(file, (step, pct) => {
           progressText.textContent = step;
           fillEl.style.width = pct + '%';
         }, presetKey, cancelToken);

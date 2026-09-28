@@ -335,6 +335,7 @@ tests/
   paths.test.mjs            # glTF path/MIME/download-name resolution
   optimizer.test.mjs        # shipping optimizer core: validation, stages, roles, paths
   optimizer-browser-textures.test.mjs  # real-canvas encoder checks (no lossy data)
+  optimizer-browser.test.mjs           # real browser/CDN graph + High/Balanced/Small uploads
   server-helpers.test.mjs   # server-side sanitizers, sniffers, wire format
   r2-storage.test.mjs       # R2 keys, validation, permissions, quota, rollback, errors
 ```
@@ -343,9 +344,14 @@ The frontend is still a plain ES module (`public/vault/app.js`) loaded through a
 native `<script type="module">` + import map, exactly like the original file.
 That is what lets the Three.js viewer, the DRACO/KTX2/Meshopt loaders and the
 `@gltf-transform` pipeline stay unchanged instead of being rewritten into a
-bundled React component. Pure helpers (path normalization, companion-file
-resolution, MIME/ext lookup, download names) live in `public/vault/shared.js`
-so the browser and the Node test suite run the *same* code.
+bundled React component. The import map is shared from
+`src/lib/vault-import-map.json`; the functions CDN URL explicitly externalizes
+`@gltf-transform/core`, so `weld`/`simplify` resolve the same core module as
+`WebIO` rather than creating a second `Document` graph registry. The upload UI
+loads the browser-specific entry in `public/vault/optimizer-upload.mjs`. Pure
+helpers (path normalization, companion-file resolution, MIME/ext lookup,
+download names) live in `public/vault/shared.js` so the browser and the Node
+test suite run the *same* code.
 
 ## The library model
 
@@ -763,6 +769,12 @@ npm run test:e2e -- --phase=2
   that normal/roughness/metallic/occlusion textures are written as PNG and
   never lossily, that photographic colour still gets the WebP win, and that
   real alpha pixels force the lossless path.
+- `tests/optimizer-browser.test.mjs` opens Chromium with the production
+  import-map JSON and production upload optimizer module, optimizes the real
+  crate GLB at High, Balanced and Small, and posts each optimized file through
+  the upload request. It also checks the live esm.sh transform module imports
+  core through the one import-map alias. Install Playwright Chromium with
+  `npx playwright install chromium`; `npm run test:browser` runs this case.
 - `tests/server-helpers.test.mjs` covers the server-side sanitizers,
   path-traversal neutralization, id validation, image sniffing and data-URL
   validation, and asserts the client and server MIME tables stay identical.
