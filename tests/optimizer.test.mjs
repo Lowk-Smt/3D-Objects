@@ -28,6 +28,7 @@ import {
   createCanvasTextureStrategy,
   pickOutputFormat,
   planTextureEncode,
+  renormalizeNormalMapPixels,
 } from "../public/vault/optimizer-browser-textures.mjs";
 import { createHeadlessTextureStrategy } from "../scripts/lib/headless-textures.mjs";
 import {
@@ -235,6 +236,9 @@ function fakeCanvasEnv({ width, height, pixels, webp = true, encodedBytes = 64 }
             },
             getImageData() {
               return { data: stored || new Uint8ClampedArray(w * h * 4) };
+            },
+            putImageData(imageData) {
+              stored = imageData.data;
             },
           };
         },
@@ -956,6 +960,63 @@ test("downscaleRgba renormalizes only when asked to", () => {
   assert.notDeepEqual(plain.data, renormalized.data);
 });
 
+test("renormalizeNormalMapPixels restores unit length and leaves alpha alone", () => {
+  // The browser helper: shortened, mixed-length vectors become unit vectors
+  // again, in place, without touching the alpha channel.
+  const width = 4;
+  const height = 2;
+  // Pixel 0 and pixel 6 are flat mid-grey — a degenerate tangent-space vector
+  // whose "direction" is pure quantization noise, so it must be left as-is.
+  const data = new Uint8ClampedArray([
+    128, 128, 128, 255, // flat → left alone
+    200, 128, 128, 255, // 0.57, 0, 0 → length 0.57
+    128, 200, 128, 128, // 0, 0.57, 0 → length 0.57, alpha 128
+    128, 128, 200, 255,
+    90, 110, 130, 255,
+    160, 90, 200, 200,
+    128, 128, 128, 255, // flat → left alone
+    200, 200, 200, 255,
+  ]);
+  const flatPixels = new Set([0, 6]);
+  const originalAlpha = Array.from(data.filter((_, i) => i % 4 === 3));
+  const before = data.slice();
+
+  renormalizeNormalMapPixels(data, width, height);
+
+  const lengths = [];
+  for (let i = 0; i < data.length; i += 4) {
+    lengths.push(
+      Math.hypot((data[i] / 255) * 2 - 1, (data[i + 1] / 255) * 2 - 1, (data[i + 2] / 255) * 2 - 1),
+    );
+  }
+
+  for (const pixel of flatPixels) {
+    assert.deepEqual(
+      data.slice(pixel * 4, pixel * 4 + 4),
+      before.slice(pixel * 4, pixel * 4 + 4),
+      `flat pixel ${pixel} must not be amplified`,
+    );
+  }
+  // Every other pixel ends up unit length (8-bit rounding keeps it close).
+  for (const [index, length] of lengths.entries()) {
+    if (flatPixels.has(index)) continue;
+    assert.ok(Math.abs(length - 1) < 0.02, `pixel ${index} has length ${length.toFixed(3)}`);
+  }
+  // Alpha is untouched, so the same map keeps its mask semantics.
+  assert.deepEqual(
+    Array.from(data.filter((_, i) => i % 4 === 3)),
+    originalAlpha,
+  );
+});
+
+test("renormalizeNormalMapPixels is idempotent", () => {
+  const data = new Uint8ClampedArray([200, 128, 128, 255, 128, 200, 128, 255]);
+  renormalizeNormalMapPixels(data, 2, 1);
+  const once = data.slice();
+  renormalizeNormalMapPixels(data, 2, 1);
+  assert.deepEqual(Array.from(data), Array.from(once), "a second pass must not drift");
+});
+
 /* ---------- browser texture decisions (pure) ---------- */
 
 test("pickOutputFormat keeps material data lossless and only colour lossy", () => {
@@ -1036,6 +1097,105 @@ test("planTextureEncode keeps a data texture that was shipped as JPEG", () => {
   assert.deepEqual(plan, { reencode: false, outputType: "image/jpeg", reason: "lossless-optimal" });
 });
 
+/**
+ * A fake canvas whose scaled drawImage BOX-AVERAGES, like a real browser's
+ * canvas does (the fake above nearest-neighbours, which never shortens
+ * vectors). Used to pin the renormalization step without a real canvas.
+ */
+function averagingFakeCanvasEnv({ width, height, pixels, encodedBytes = 64 }) {
+  // Every frame the shipping code writes back with putImageData, so a test can
+  // inspect the pixels it actually encoded.
+  const captured = [];
+  return {
+    captured,
+    async createImageBitmap() {
+      return { width, height, close() {}, __pixels: pixels };
+    },
+    createCanvas(w, h) {
+      return {
+        width: w,
+        height: h,
+        getContext() {
+          let stored = null;
+          return {
+            drawImage(bitmap) {
+              const sw = bitmap.width;
+              const sh = bitmap.height;
+              const out = new Uint8ClampedArray(w * h * 4);
+              for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                  const sx0 = Math.floor((x * sw) / w);
+                  const sx1 = Math.max(sx0 + 1, Math.floor(((x + 1) * sw) / w));
+                  const sy0 = Math.floor((y * sh) / h);
+                  const sy1 = Math.max(sy0 + 1, Math.floor(((y + 1) * sh) / h));
+                  let r = 0;
+                  let g = 0;
+                  let b = 0;
+                  let a = 0;
+                  let n = 0;
+                  for (let sy = sy0; sy < sy1; sy++) {
+                    for (let sx = sx0; sx < sx1; sx++) {
+                      const si = (sy * sw + sx) * 4;
+                      r += bitmap.__pixels[si];
+                      g += bitmap.__pixels[si + 1];
+                      b += bitmap.__pixels[si + 2];
+                      a += bitmap.__pixels[si + 3];
+                      n++;
+                    }
+                  }
+                  const ti = (y * w + x) * 4;
+                  out[ti] = r / n;
+                  out[ti + 1] = g / n;
+                  out[ti + 2] = b / n;
+                  out[ti + 3] = a / n;
+                }
+              }
+              stored = out;
+            },
+            getImageData() {
+              return { data: stored || new Uint8ClampedArray(w * h * 4) };
+            },
+            putImageData(imageData) {
+              stored = imageData.data;
+              captured.push(new Uint8ClampedArray(imageData.data));
+            },
+          };
+        },
+        toBlob(cb, type) {
+          cb(new Blob([new Uint8Array(encodedBytes)], { type }));
+        },
+      };
+    },
+  };
+}
+
+function vectorLengths(data) {
+  const lengths = [];
+  for (let i = 0; i < data.length; i += 4) {
+    lengths.push(
+      Math.hypot((data[i] / 255) * 2 - 1, (data[i + 1] / 255) * 2 - 1, (data[i + 2] / 255) * 2 - 1),
+    );
+  }
+  return lengths;
+}
+
+/** A normal map whose neighbouring vectors point in opposite directions. */
+function highContrastNormalRgba(size) {
+  return rgba(size, size, (x, y) => {
+    const flip = (Math.floor(x / 2) + Math.floor(y / 2)) % 2 === 0 ? 1 : -1;
+    const nx = flip * 0.7;
+    const ny = flip * 0.2;
+    const nz = 0.68;
+    const length = Math.hypot(nx, ny, nz);
+    return [
+      Math.round(((nx / length) * 0.5 + 0.5) * 255),
+      Math.round(((ny / length) * 0.5 + 0.5) * 255),
+      Math.round(((nz / length) * 0.5 + 0.5) * 255),
+      255,
+    ];
+  });
+}
+
 /* ---------- browser texture strategy (fake canvas env) ---------- */
 
 test("the browser path downscales and re-encodes an oversized texture", async () => {
@@ -1067,6 +1227,51 @@ test("the browser path re-encodes a downscaled normal map as PNG, never lossy", 
   assert.equal(outcome.changed, true);
   assert.equal(outcome.to.mimeType, "image/png", "normal maps must stay lossless");
   assert.equal(texture.getMimeType(), "image/png");
+});
+
+test("the browser path renormalizes a downscaled normal map when the canvas filter averages", async () => {
+  // The deterministic twin of the real-canvas check above: an averaging canvas
+  // (what a real browser does) proves the renormalization happens on the path
+  // uploads actually take, without depending on a real canvas being installed.
+  const doc = new Document();
+  const texture = doc.createTexture("normal").setImage(new Uint8Array([9, 9, 9])).setMimeType("image/png");
+  const env = averagingFakeCanvasEnv({ width: 96, height: 96, pixels: highContrastNormalRgba(96) });
+  const strategy = createCanvasTextureStrategy(env);
+
+  const outcome = await strategy.resize(texture, { maxSize: 32, role: "normal" });
+
+  assert.equal(outcome.changed, true);
+  assert.equal(outcome.to.mimeType, "image/png", "normal maps stay lossless");
+  assert.equal(texture.getMimeType(), "image/png");
+  assert.equal(env.captured.length, 1, "the renormalized frame was written back to the canvas");
+
+  const lengths = vectorLengths(env.captured[0]);
+  assert.equal(lengths.length, 32 * 32, "the written-back frame is the downscaled one");
+  for (const [index, length] of lengths.entries()) {
+    assert.ok(Math.abs(length - 1) < 0.02, `pixel ${index} has length ${length.toFixed(3)}`);
+  }
+});
+
+test("the averaging filter alone really does shorten these normal vectors", async () => {
+  // Control for the test above: it would pass vacuously if the filter never
+  // shortened anything, so pin the failure mode it guards against.
+  const env = averagingFakeCanvasEnv({ width: 96, height: 96, pixels: highContrastNormalRgba(96) });
+  const bitmap = await env.createImageBitmap();
+  const canvas = env.createCanvas(32, 32);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0, 32, 32);
+  const filtered = ctx.getImageData(0, 0, 32, 32).data;
+
+  const lengths = vectorLengths(filtered);
+  const mean = lengths.reduce((total, length) => total + length, 0) / lengths.length;
+  assert.ok(mean < 0.9, `averaging should shorten vectors (mean ${mean.toFixed(3)})`);
+
+  // Renormalizing that same frame is what the strategy does for us.
+  const repaired = new Uint8ClampedArray(filtered);
+  renormalizeNormalMapPixels(repaired, 32, 32);
+  const repairedMean =
+    vectorLengths(repaired).reduce((total, length) => total + length, 0) / lengths.length;
+  assert.ok(Math.abs(repairedMean - 1) < 0.02, `renormalization should restore unit length (mean ${repairedMean.toFixed(3)})`);
 });
 
 test("the browser path re-encodes a downscaled roughness/metallic map as PNG", async () => {

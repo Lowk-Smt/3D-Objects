@@ -80,6 +80,41 @@ export function planTextureEncode({
   return { reencode: false, outputType: normalized, reason: 'lossy-optimal' };
 }
 
+/**
+ * One 8-bit step per channel is 2/255 in tangent space. A vector shorter than
+ * that carries no resolvable direction (a flat/degenerate pixel), so
+ * renormalizing it would only amplify quantization noise into a bogus
+ * direction. The headless path uses the same threshold.
+ */
+const DEGENERATE_NORMAL_LENGTH = 2 / 255;
+
+/**
+ * Renormalize tangent-space normal-map pixels in place (RGBA8).
+ *
+ * Bilinear canvas filtering averages normalized vectors, which shortens and
+ * biases them — a filtered normal map no longer describes unit-length
+ * surface directions, so light bends wrongly. This reads the RGB channels as
+ * tangent-space vectors (n = rgb/255*2-1), restores unit length and writes
+ * the RGB channels back. Alpha is left untouched.
+ *
+ * Pure and exported so it can be tested without a canvas.
+ */
+export function renormalizeNormalMapPixels(data, width, height) {
+  const pixelCount = width * height;
+  for (let i = 0; i < pixelCount; i++) {
+    const offset = i * 4;
+    const nx = (data[offset] / 255) * 2 - 1;
+    const ny = (data[offset + 1] / 255) * 2 - 1;
+    const nz = (data[offset + 2] / 255) * 2 - 1;
+    const length = Math.hypot(nx, ny, nz);
+    if (length < DEGENERATE_NORMAL_LENGTH) continue; // noise, not a direction
+    data[offset] = Math.round(((nx / length) * 0.5 + 0.5) * 255);
+    data[offset + 1] = Math.round(((ny / length) * 0.5 + 0.5) * 255);
+    data[offset + 2] = Math.round(((nz / length) * 0.5 + 0.5) * 255);
+  }
+  return data;
+}
+
 function defaultCreateCanvas(width, height) {
   const canvas = document.createElement('canvas');
   canvas.width = width;
@@ -175,6 +210,15 @@ export function createCanvasTextureStrategy(env = {}) {
         const canvas = createCanvas(outWidth, outHeight);
         const ctx = canvas.getContext('2d');
         ctx.drawImage(bitmap, 0, 0, outWidth, outHeight);
+
+        // Canvas filtering averages normalized vectors: a downscaled normal
+        // map must be renormalized before it is written, or every filtered
+        // pixel describes a shortened, biased direction.
+        if (role === 'normal') {
+          const frame = ctx.getImageData(0, 0, outWidth, outHeight);
+          renormalizeNormalMapPixels(frame.data, outWidth, outHeight);
+          ctx.putImageData(frame, 0, 0);
+        }
 
         const encodeQuality = plan.outputType === PNG_MIME ? undefined : quality;
         const blob = await canvasToBlob(canvas, plan.outputType, encodeQuality);

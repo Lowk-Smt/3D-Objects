@@ -250,6 +250,14 @@ export function hasAlphaChannel(rgba) {
 }
 
 /**
+ * One 8-bit step per channel is 2/255 in tangent space. A vector shorter than
+ * that carries no resolvable direction (a flat/degenerate pixel), so
+ * renormalizing it would only amplify quantization noise into a bogus
+ * direction. Both the headless and the browser path use the same threshold.
+ */
+const DEGENERATE_NORMAL_LENGTH = 2 / 255;
+
+/**
  * Bilinear downscale of straight RGBA8 so the longest edge fits maxSize.
  * Never upscales. Returns the new dimensions alongside the pixels.
  *
@@ -290,7 +298,8 @@ export function downscaleRgba(rgba, width, height, maxSize, { renormalize = fals
       const nx = (out[i] / 255) * 2 - 1;
       const ny = (out[i + 1] / 255) * 2 - 1;
       const nz = (out[i + 2] / 255) * 2 - 1;
-      const length = Math.hypot(nx, ny, nz) || 1;
+      const length = Math.hypot(nx, ny, nz);
+      if (length < DEGENERATE_NORMAL_LENGTH) continue; // noise, not a direction
       out[i] = Math.round(((nx / length) * 0.5 + 0.5) * 255);
       out[i + 1] = Math.round(((ny / length) * 0.5 + 0.5) * 255);
       out[i + 2] = Math.round(((nz / length) * 0.5 + 0.5) * 255);

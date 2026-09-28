@@ -511,7 +511,15 @@ validate GLB → read → prune → dedup → simplify → textures → dedup �
     decode → per-texture alpha scan → one-time WebP probe → codec choice →
     canvas downscale. Textures within the preset cap are left alone unless a
     strictly better codec exists, and a re-encode that would *grow* the bytes
-    is discarded — per texture, not just per file.
+    is discarded — per texture, not just per file. Because uploads are
+    optimized in the browser, this is the half that matters most in
+    production, so it is verified against a real canvas implementation
+    (real decode, real filtering, real encoders) and not only a stub.
+    Downscaled **normal maps are renormalized** on this path too: canvas
+    filtering averages normalized vectors, which shortens and biases them, so
+    the RGB channels are read back as tangent-space vectors, restored to unit
+    length (pixels too short to carry a direction are left alone) and written
+    back before the lossless PNG encode.
   - *Headless half* (`scripts/lib/headless-textures.mjs`): a dependency-free
     pure-JS PNG path (zlib inflate → unfilter → bilinear downscale →
     re-encode, dropping the alpha channel when the result is opaque) used by

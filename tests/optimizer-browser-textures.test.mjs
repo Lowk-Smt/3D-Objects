@@ -25,7 +25,11 @@ import assert from "node:assert/strict";
 
 import { Document } from "@gltf-transform/core";
 
-import { createCanvasTextureStrategy, planTextureEncode } from "../public/vault/optimizer-browser-textures.mjs";
+import {
+  createCanvasTextureStrategy,
+  planTextureEncode,
+  renormalizeNormalMapPixels,
+} from "../public/vault/optimizer-browser-textures.mjs";
 import { decodePng, encodePng } from "../scripts/lib/png-codec.mjs";
 
 /** Real canvas environment: loadImage (real decode) + createCanvas (real 2D). */
@@ -39,6 +43,114 @@ async function loadRealCanvas() {
       return createCanvas(width, height);
     },
   };
+}
+
+/**
+ * A real canvas whose drawImage performs the BOX-AVERAGING filter a real
+ * browser applies when downscaling. (This particular canvas build happens to
+ * nearest-neighbour scaled draws, which never shortens vectors and would make
+ * the renormalization test vacuous — so the averaging is installed explicitly,
+ * on top of the real decode / real encode.)
+ */
+function averagingCanvasEnv(base) {
+  return {
+    async createImageBitmap(blob) {
+      return base.createImageBitmap(blob);
+    },
+    createCanvas(width, height) {
+      const canvas = base.createCanvas(width, height);
+      const ctx = canvas.getContext("2d");
+      const originalDrawImage = ctx.drawImage.bind(ctx);
+      ctx.drawImage = (image, dx, dy, dw, dh) => {
+        const targetWidth = dw ?? image.width;
+        const targetHeight = dh ?? image.height;
+        if (targetWidth === image.width && targetHeight === image.height) {
+          return originalDrawImage(image, dx, dy, targetWidth, targetHeight);
+        }
+        const source = base.createCanvas(image.width, image.height);
+        const sourceCtx = source.getContext("2d");
+        sourceCtx.drawImage(image, 0, 0);
+        const sourceData = sourceCtx.getImageData(0, 0, image.width, image.height).data;
+        const frame = ctx.createImageData(targetWidth, targetHeight);
+        const out = frame.data;
+        for (let y = 0; y < targetHeight; y++) {
+          const sy0 = Math.floor((y * image.height) / targetHeight);
+          const sy1 = Math.max(sy0 + 1, Math.floor(((y + 1) * image.height) / targetHeight));
+          for (let x = 0; x < targetWidth; x++) {
+            const sx0 = Math.floor((x * image.width) / targetWidth);
+            const sx1 = Math.max(sx0 + 1, Math.floor(((x + 1) * image.width) / targetWidth));
+            let r = 0;
+            let g = 0;
+            let b = 0;
+            let a = 0;
+            let n = 0;
+            for (let sy = sy0; sy < sy1; sy++) {
+              for (let sx = sx0; sx < sx1; sx++) {
+                const i = (sy * image.width + sx) * 4;
+                r += sourceData[i];
+                g += sourceData[i + 1];
+                b += sourceData[i + 2];
+                a += sourceData[i + 3];
+                n++;
+              }
+            }
+            const o = (y * targetWidth + x) * 4;
+            out[o] = r / n;
+            out[o + 1] = g / n;
+            out[o + 2] = b / n;
+            out[o + 3] = a / n;
+          }
+        }
+        ctx.putImageData(frame, 0, 0);
+      };
+      return canvas;
+    },
+  };
+}
+
+/** A normal map whose neighbouring vectors point in opposite directions. */
+function highContrastNormalPng(size) {
+  return encodePng({
+    width: size,
+    height: size,
+    data: rgba(size, size, (x, y) => {
+      const flip = (Math.floor(x / 2) + Math.floor(y / 2)) % 2 === 0 ? 1 : -1;
+      const nx = flip * 0.7;
+      const ny = flip * 0.2;
+      const nz = 0.68;
+      const length = Math.hypot(nx, ny, nz);
+      return [
+        Math.round(((nx / length) * 0.5 + 0.5) * 255),
+        Math.round(((ny / length) * 0.5 + 0.5) * 255),
+        Math.round(((nz / length) * 0.5 + 0.5) * 255),
+        255,
+      ];
+    }),
+  });
+}
+
+function meanVectorLength(rgbaData) {
+  let total = 0;
+  let count = 0;
+  for (let i = 0; i < rgbaData.length; i += 4) {
+    total += Math.hypot(
+      (rgbaData[i] / 255) * 2 - 1,
+      (rgbaData[i + 1] / 255) * 2 - 1,
+      (rgbaData[i + 2] / 255) * 2 - 1,
+    );
+    count++;
+  }
+  return total / count;
+}
+
+/** Decode real encoded bytes back through the real canvas. */
+async function decodeWithRealCanvas(bytes) {
+  const { loadImage } = await import("@napi-rs/canvas");
+  const image = await loadImage(Buffer.from(bytes));
+  const probe = realCanvas.createCanvas(image.width, image.height);
+  const ctx = probe.getContext("2d");
+  ctx.drawImage(image, 0, 0);
+  return ctx.getImageData(0, 0, image.width, image.height).data;
 }
 
 function rgba(width, height, paint) {
@@ -274,4 +386,108 @@ test("the role survives into the strategy outcome for observability", real, asyn
   assert.equal(outcome.reason, "downscale");
   assert.deepEqual(Object.keys(outcome.from).sort(), ["bytes", "height", "mimeType", "width"]);
   assert.deepEqual(Object.keys(outcome.to).sort(), ["bytes", "height", "mimeType", "width"]);
+});
+
+test("a real downscaled browser normal map stays unit-length after decoding", real, async () => {
+  const env = averagingCanvasEnv(realCanvas);
+  const strategy = createCanvasTextureStrategy(env);
+
+  const doc = new Document();
+  const png = highContrastNormalPng(96);
+  const texture = doc.createTexture("normal").setImage(png).setMimeType("image/png");
+
+  const outcome = await strategy.resize(texture, { maxSize: 32, role: "normal" });
+  assert.equal(outcome.changed, true);
+  assert.equal(outcome.to.mimeType, "image/png");
+  assert.ok(isPng(texture.getImage()), "normal maps must be written losslessly");
+
+  // Decode the REAL encoded bytes and check every vector is ~unit length.
+  const decoded = await decodeWithRealCanvas(texture.getImage());
+  assert.equal(decoded.length, 32 * 32 * 4);
+  for (let i = 0; i < decoded.length; i += 4) {
+    const length = Math.hypot(
+      (decoded[i] / 255) * 2 - 1,
+      (decoded[i + 1] / 255) * 2 - 1,
+      (decoded[i + 2] / 255) * 2 - 1,
+    );
+    assert.ok(Math.abs(length - 1) < 0.05, `normal ${i / 4} has length ${length.toFixed(3)}`);
+  }
+});
+
+test("the same averaging filter WITHOUT renormalization would corrupt the map", real, async () => {
+  // The control: proves this test can actually detect the bug it guards
+  // against — the averaging filter really does shorten these vectors.
+  const env = averagingCanvasEnv(realCanvas);
+  const { loadImage } = await import("@napi-rs/canvas");
+  const image = await loadImage(Buffer.from(highContrastNormalPng(96)));
+
+  const canvas = env.createCanvas(32, 32);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(image, 0, 0, 32, 32);
+  const filtered = ctx.getImageData(0, 0, 32, 32).data;
+
+  assert.ok(meanVectorLength(filtered) < 0.9,
+    `expected the averaging filter to shorten vectors, mean was ${meanVectorLength(filtered).toFixed(3)}`);
+
+  // ...and renormalizing the very same frame restores them.
+  const repaired = new Uint8ClampedArray(filtered);
+  renormalizeNormalMapPixels(repaired, 32, 32);
+  assert.ok(Math.abs(meanVectorLength(repaired) - 1) < 0.02,
+    `renormalization should restore unit length, mean was ${meanVectorLength(repaired).toFixed(3)}`);
+});
+
+test("a real colour texture is untouched by the renormalization step", real, async () => {
+  // The averaging filter applies to colour textures too, but colour vectors
+  // must NOT be renormalized — doing so would warp photographic colours. A
+  // smooth gradient gives an exact expected value for every output pixel, so
+  // any warp (renormalization included) shows up as a large per-channel error.
+  const size = 96;
+  const source = rgba(size, size, (x, y) => [
+    Math.round(30 + (200 * x) / (size - 1)),
+    Math.round(60 + (150 * y) / (size - 1)),
+    Math.round(255 - (220 * x) / (size - 1)),
+    255,
+  ]);
+  const expected = [];
+  for (let oy = 0; oy < 32; oy++) {
+    for (let ox = 0; ox < 32; ox++) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let n = 0;
+      for (let sy = oy * 3; sy < oy * 3 + 3; sy++) {
+        for (let sx = ox * 3; sx < ox * 3 + 3; sx++) {
+          const i = (sy * size + sx) * 4;
+          r += source[i];
+          g += source[i + 1];
+          b += source[i + 2];
+          n++;
+        }
+      }
+      expected.push(r / n, g / n, b / n);
+    }
+  }
+
+  const env = averagingCanvasEnv(realCanvas);
+  const strategy = createCanvasTextureStrategy(env);
+  const doc = new Document();
+  const png = encodePng({ width: size, height: size, data: source });
+  const texture = doc.createTexture("albedo").setImage(png).setMimeType("image/png");
+
+  const outcome = await strategy.resize(texture, { maxSize: 32, role: "color" });
+  assert.equal(outcome.to.mimeType, "image/webp", "colour still takes the lossy path");
+  assert.ok(isWebp(texture.getImage()));
+
+  const decoded = await decodeWithRealCanvas(texture.getImage());
+  let worst = 0;
+  for (let i = 0; i < decoded.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      worst = Math.max(worst, Math.abs(decoded[i + c] - expected[(i / 4) * 3 + c]));
+    }
+  }
+  assert.ok(
+    worst < 12,
+    "colour pixels should match the plain average (worst channel delta " + worst.toFixed(1) +
+      "); re-normalizing colour data would produce much larger errors",
+  );
 });
