@@ -20,6 +20,14 @@ import {
         abort), pure logic shared with tests/preview-cache.test.mjs ---- */
 import { createPreviewDownloader } from './preview-cache.js';
 
+/* ---- transfer measurement helpers (pure, shared with
+        tests/transfer-stats.test.mjs) — make every byte transfer report
+        which transport carried it, who served it, and how fast it was ---- */
+import {
+  describeResourceTiming, findResourceTiming, formatBytes, hostOf,
+  pickReadableHeaders, throughputMbps,
+} from './transfer-stats.js';
+
 /* ---- wireframe edge extraction, shared with the worker and the tests ---- */
 import {
   DEFAULT_THRESHOLD_ANGLE, WORKER_FILE_URL, buildWorkerPayload
@@ -243,8 +251,51 @@ const api = {
 // the only request that ever goes straight to storage (no cookies, no
 // credentials; the signature is the authorization and it expires quickly).
 
-async function fetchDirectBlob(url, signal){
+function nowMs(){
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+
+/**
+ * Prints one [perf:transfer] line (plus a details object) for a completed
+ * byte transfer. This is the production evidence that answers: which
+ * transport carried the bytes (direct from the bucket vs proxied through
+ * the API), which host served them, the status, size, duration, throughput,
+ * whatever response headers the origin exposed cross-origin, and the
+ * resource-timing breakdown when the browser allows one. All reads are
+ * best-effort — cross-origin responses only expose what the bucket's CORS
+ * rules allow, and this must never break the transfer it describes.
+ */
+function reportTransfer(kind, name, url, getHeader, status, bytes, startedAt, extra){
+  try {
+    const ms = Math.max(1, Math.round(nowMs() - startedAt));
+    const mbps = throughputMbps(bytes, ms);
+    const details = Object.assign({
+      kind,
+      name,
+      host: hostOf(url) || null,
+      url: String(url || ''),
+      status: status === null || status === undefined ? null : status,
+      bytes: Number(bytes) || 0,
+      ms,
+      mbps,
+      headers: pickReadableHeaders(getHeader),
+      resourceTiming: (() => {
+        const rt = findResourceTiming(url, typeof performance !== 'undefined' ? performance : null);
+        return rt ? describeResourceTiming(rt) : null;
+      })(),
+    }, extra || {});
+    console.info(
+      `[perf:transfer] ${kind} ${name}: ${formatBytes(bytes)} in ${ms}ms`
+        + (mbps ? ` (~${mbps} Mbps)` : '')
+        + ` host=${details.host || '?'} status=${details.status === null ? '?' : details.status}`,
+      details,
+    );
+  } catch { /* diagnostics must never break the transfer */ }
+}
+
+async function fetchDirectBlob(url, name, signal){
   let response;
+  const startedAt = nowMs();
   try {
     // Cross-origin request to object storage. No credentials: presigned GET
     // authorization travels in the signed query string, and none of the
@@ -264,30 +315,72 @@ async function fetchDirectBlob(url, signal){
       : `Could not download this file from storage (${response.status}).`;
     throw new ApiClientError(response.status, message);
   }
-  return response.blob();
+  const blob = await response.blob();
+  // response.url is the URL the bytes actually came from (after any
+  // redirect); headers beyond the CORS-exposed subset read as null.
+  reportTransfer('preview direct', name, response.url || url,
+    (h) => response.headers.get(h), response.status, blob.size, startedAt);
+  return blob;
 }
 
 async function fetchProxiedBlob(meta, signal){
   // Same authorization as every other API call (session cookie); the server
   // streams the bytes with the sandbox/nosniff headers the bucket can't add.
+  const startedAt = nowMs();
   const response = await apiFetch(`/api/files/${encodeURIComponent(meta.id)}/raw?proxy=1`, { signal });
-  if (response instanceof Response) return response.blob();
+  if (response instanceof Response){
+    const blob = await response.blob();
+    reportTransfer('preview proxied', meta.name, response.url || `/api/files/${meta.id}/raw?proxy=1`,
+      (h) => response.headers.get(h), response.status, blob.size, startedAt,
+      { note: 'bytes streamed through the API (server-side), NOT direct from storage' });
+    return blob;
+  }
   throw new ApiClientError(0, 'Unexpected preview response from the server.');
 }
 
 async function fetchModelBytes(meta, signal){
+  // Leg 1 — envelope: the authenticated /raw call. Session auth, the file
+  // lookup and presigning all happen here (the route reports each under
+  // Server-Timing, logged by apiFetch). Timed separately so that
+  // preview:transfer below measures ONLY the byte leg — previously a single
+  // preview:fetch timer lumped this server round trip into the transfer,
+  // overstating it by the envelope cost on every load.
+  const envelopeTimer = perf.time(`preview:envelope:${meta.name}`);
   const info = await apiFetch(`/api/files/${encodeURIComponent(meta.id)}/raw`, { signal });
+  envelopeTimer.end();
 
   if (info && typeof info.url === 'string'){
+    // Leg 2 — bytes. Direct-to-bucket first (one attempt), proxied fallback
+    // only on network/CORS-level failure. The transport choice is logged
+    // loudly either way: a silent fallback is indistinguishable from a
+    // working direct path, and the two have completely different speeds.
+    const transferTimer = perf.time(`preview:transfer:${meta.name}`);
+    let blob;
     try {
-      return await fetchDirectBlob(info.url, signal);
+      blob = await fetchDirectBlob(info.url, meta.name, signal);
     } catch (err){
       // Only network-level failures fall back; storage's own answers
       // (403 expired link, 404 missing object, …) must surface as-is so the
       // user sees the real cause instead of a silent second request.
-      if ((signal && signal.aborted) || (err instanceof ApiClientError && err.status !== 0)) throw err;
-      return await fetchProxiedBlob(meta, signal);
+      if ((signal && signal.aborted) || (err instanceof ApiClientError && err.status !== 0)){
+        transferTimer.end('failed');
+        throw err;
+      }
+      console.warn('[perf:transfer] preview direct fetch failed ('
+        + ((err && err.message) || 'network error')
+        + '); retrying via /raw?proxy=1 — bytes will stream through the server, not direct from storage.'
+        + ' If this keeps happening, the bucket CORS rules likely do not allow s3_get for this origin.');
+      try {
+        blob = await fetchProxiedBlob(meta, signal);
+      } catch (fallbackErr){
+        transferTimer.end('fallback failed');
+        throw fallbackErr;
+      }
+      transferTimer.end('proxied fallback');
+      return blob;
     }
+    transferTimer.end(`${blob.size}B`);
+    return blob;
   }
 
   // The server streamed the bytes itself (active-content MIME types are
@@ -342,7 +435,17 @@ function uploadWithProgress(file, relPath, extra, onProgress){
     };
 
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      if (xhr.status >= 200 && xhr.status < 300){
+        // Evidence for the upload leg: this PUT goes straight from the
+        // browser to the bucket (no server in the path), so its duration is
+        // purely browser<->storage network time. responseURL shows the URL
+        // the bytes actually landed on (differs from uploadUrl only if
+        // storage redirected).
+        reportTransfer('upload PUT', file.name, xhr.responseURL || uploadUrl,
+          (h) => { try { return xhr.getResponseHeader(h); } catch { return null; } },
+          xhr.status, file.size, putStartedAt);
+        resolve();
+      }
       else reject(new ApiClientError(xhr.status, `The direct upload to storage failed (${xhr.status}). Please try again.`));
     };
 
@@ -350,6 +453,7 @@ function uploadWithProgress(file, relPath, extra, onProgress){
       reject(new ApiClientError(0, "Can't reach object storage to upload this file. Check your connection and try again."));
     };
 
+    const putStartedAt = nowMs();
     xhr.send(file);
   });
 
@@ -401,6 +505,70 @@ function uploadWithProgress(file, relPath, extra, onProgress){
       throw err;
     }
   })();
+}
+
+/**
+ * Opt-in production diagnostic (console only — the app never calls this):
+ * `await __vaultTransferProbe(fileIdOrUrl, 3)` re-fetches one resource N
+ * times and prints a table with per-attempt status, final URL, host, bytes,
+ * duration, throughput and whatever cache headers the origin exposed, so
+ * "do repeated requests behave differently?" can be answered in the exact
+ * environment that matters. Pass a file id to probe its preview bytes via a
+ * freshly minted presigned GET, or an absolute URL to probe it directly.
+ */
+if (typeof window !== 'undefined'){
+  window.__vaultTransferProbe = async function __vaultTransferProbe(target, attempts = 3){
+    let url = String(target);
+    if (!/^https?:\/\//i.test(url)){
+      const info = await apiFetch(`/api/files/${encodeURIComponent(url)}/raw`, {});
+      if (!(info && typeof info.url === 'string')){
+        console.warn('[perf:transfer] probe: no presigned URL for', target, '— is this a file id?');
+        return null;
+      }
+      url = info.url;
+    }
+    const rows = [];
+    for (let i = 0; i < attempts; i++){
+      const startedAt = nowMs();
+      let response;
+      try {
+        response = await fetch(url, { credentials: 'omit', redirect: 'error' });
+      } catch (err){
+        rows.push({ attempt: i + 1, error: String((err && err.message) || err) });
+        continue;
+      }
+      const blob = await response.blob();
+      const ms = Math.max(1, Math.round(nowMs() - startedAt));
+      const rt = findResourceTiming(response.url || url, typeof performance !== 'undefined' ? performance : null);
+      rows.push({
+        attempt: i + 1,
+        status: response.status,
+        host: hostOf(response.url || url),
+        bytes: blob.size,
+        ms,
+        mbps: throughputMbps(blob.size, ms),
+        headers: pickReadableHeaders((h) => response.headers.get(h)),
+        resourceTiming: rt ? describeResourceTiming(rt) : null,
+      });
+    }
+    console.table(rows.map((r) => ({
+      attempt: r.attempt,
+      status: r.status,
+      host: r.host,
+      bytes: r.bytes,
+      ms: r.ms,
+      mbps: r.mbps,
+      'cache-control': r.headers && r.headers['cache-control'],
+      'x-vercel-cache': r.headers && r.headers['x-vercel-cache'],
+      via: r.headers && r.headers.via,
+      error: r.error,
+    })));
+    console.info('[perf:transfer] probe details:', rows);
+    console.info('[perf:transfer] probe of', hostOf(url) || url,
+      '— near-identical ms across attempts with tiny bytes suggests a cache hit;'
+      + ' wildly different attempts suggest congestion/throttling on the path.');
+    return rows;
+  };
 }
 
 /* ============================================================

@@ -679,6 +679,49 @@ npm run test:e2e -- --phase=2
   of sessions, metadata, bytes, thumbnails and companion resolution across a
   server restart.
 
+## Diagnosing slow transfers
+
+Every byte transfer the browser performs prints a `[perf:transfer]` line to
+the console (with an expandable details object), so production slowness can
+be attributed without guessing:
+
+- **`preview direct`** — preview bytes fetched straight from the private
+  bucket via the presigned GET. `host` is the bucket's S3 endpoint; this
+  path never touches the serverless function.
+- **`preview proxied`** — the same bytes streamed through
+  `GET /api/files/:id/raw?proxy=1` after the direct fetch failed at the
+  network/CORS level (also announced by a `console.warn`). If you see this
+  regularly, the bucket's CORS rules are missing `s3_get` for your origin
+  and every preview is paying for a serverless round trip.
+- **`upload PUT`** — the browser's direct `PUT` to the presigned upload URL.
+  No server is in this path, so its duration is pure browser ↔ bucket
+  network time.
+
+Each line reports the serving host, status, bytes, duration, throughput
+(~Mbps), whatever response headers the origin exposed cross-origin
+(cache-control, server-timing, `x-vercel-*`/`via` proxy fingerprints, …),
+and the resource-timing breakdown when the browser allows one (phase
+timings are only available with a `Timing-Allow-Origin` header; otherwise
+only total duration is reliable). The old `preview:fetch` timer is still
+logged for continuity, but the console also splits it into
+`preview:envelope` (the authenticated `/raw` round trip: session auth, file
+lookup, presigning — the part Server-Timing covers) and `preview:transfer`
+(the byte leg itself), so server latency is no longer counted as transfer
+time.
+
+To answer "do repeated requests behave differently?" in the exact
+environment that matters, run in the browser console:
+
+```js
+await __vaultTransferProbe("<file-id>", 3)   // or an absolute URL
+```
+
+It re-fetches one resource N times and prints a table of per-attempt
+status, host, bytes, duration, throughput and cache headers. Near-identical
+attempts with a tiny byte count suggest a cache hit; wildly varying
+attempts suggest congestion or throttling on the network path rather than
+the application.
+
 ## Limitations
 
 - **Serverless request bodies are small.** Vercel caps function request bodies
